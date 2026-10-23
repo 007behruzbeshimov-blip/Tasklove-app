@@ -1,0 +1,701 @@
+'use strict';
+
+/* --------------------------------------------------------------------------
+   tasklove. — sahifalarni chizish
+   -------------------------------------------------------------------------- */
+
+function renderApp() {
+  if (!app.data) return;
+  renderHeader();
+  updateNav();
+  updatePresenceUI();
+
+  const route = app.route;
+  let html = '';
+  let title = 'tasklove. — kichik vazifalar, katta hislar';
+
+  if (route.name === 'people') {
+    html = renderPeople();
+    title = 'Yuraklar bog‘i — tasklove.';
+  } else if (route.name === 'profile') {
+    const user = route.self ? app.data.me : findUser(route.userId);
+    if (user) {
+      html = renderProfile(user);
+      title = `${user.display_name} — tasklove.`;
+    } else {
+      html = renderMissingProfile();
+      title = 'Yurak topilmadi — tasklove.';
+    }
+  } else {
+    html = renderBoard();
+  }
+
+  dom.viewRoot.innerHTML = html;
+  document.title = title;
+  updatePresenceUI();
+}
+
+function renderHeader() {
+  const me = currentUser();
+  if (!me) return;
+
+  const name = document.querySelector('[data-header-name]');
+  const points = document.querySelector('[data-header-points]');
+  const headerAvatar = document.querySelector('[data-header-avatar]');
+  const mobileAvatar = document.querySelector('[data-mobile-avatar]');
+  const headerProfile = document.querySelector('[data-header-profile]');
+  const mobileProfile = document.querySelector('[data-mobile-profile]');
+
+  if (name) name.textContent = me.display_name;
+  if (points) points.textContent = String(me.points);
+  if (headerAvatar) {
+    headerAvatar.className = 'avatar avatar--xs';
+    headerAvatar.style.setProperty('--accent', safeAccent(me.accent));
+    headerAvatar.innerHTML = `<span class="avatar-emoji">${esc(safeEmoji(me.emoji))}</span>`;
+  }
+  if (mobileAvatar) {
+    mobileAvatar.className = 'avatar avatar--mobile';
+    mobileAvatar.style.setProperty('--accent', safeAccent(me.accent));
+    mobileAvatar.innerHTML = `<span class="avatar-emoji">${esc(safeEmoji(me.emoji))}</span>`;
+  }
+  if (headerProfile) headerProfile.setAttribute('href', '#/me');
+  if (mobileProfile) mobileProfile.setAttribute('href', '#/me');
+}
+
+function updateNav() {
+  const route = app.route;
+  let active = 'board';
+  if (route.name === 'people') active = 'people';
+  else if (route.name === 'profile') active = route.self ? 'me' : 'people';
+
+  document.querySelectorAll('.desktop-nav [data-nav]').forEach((link) => {
+    link.classList.toggle('is-active', link.dataset.nav === active && active !== 'me');
+  });
+  document.querySelectorAll('.mobile-nav [data-nav]').forEach((link) => {
+    link.classList.toggle('is-active', link.dataset.nav === active);
+  });
+}
+
+function updatePresenceUI() {
+  if (!app.data) return;
+  const online = new Set(app.data.onlineUserIds);
+  const onlineCount = online.size;
+
+  document.querySelectorAll('[data-online-count]').forEach((node) => {
+    node.textContent = String(onlineCount);
+  });
+
+  document.querySelectorAll('[data-user-online]').forEach((node) => {
+    const isOnline = online.has(node.dataset.userOnline);
+    node.classList.toggle('is-online', isOnline);
+    const word = node.querySelector('[data-online-word]');
+    if (word) word.textContent = isOnline ? 'onlayn' : 'oflayn';
+  });
+
+  const faces = document.querySelector('[data-online-faces]');
+  if (faces) {
+    const onlineUsers = app.data.users.filter((user) => online.has(user.id));
+    faces.innerHTML = avatarStackHtml(onlineUsers, 5);
+  }
+
+  const onlineCopy = document.querySelector('[data-online-copy]');
+  if (onlineCopy) {
+    onlineCopy.innerHTML = onlineCopyHtml(onlineCount);
+  }
+}
+
+function onlineCopyHtml(onlineCount) {
+  if (onlineCount <= 1) {
+    return 'Hozir faqat siz onlaynsiz. Do‘stingizni chaqiring — birgalikda o‘ynash shirinroq.';
+  }
+  return `<strong>${onlineCount} ta yurak</strong> hozir shu yerda. Kimdir sizga vazifa tashlagan bo‘lishi mumkin.`;
+}
+
+/* --------------------------------------------------------------------------
+   Oqim
+   -------------------------------------------------------------------------- */
+
+function getFilteredTasks() {
+  const tasks = app.data.tasks;
+  let filtered = tasks;
+
+  if (app.filter === 'done') {
+    filtered = tasks.filter((task) => task.status === 'completed');
+    return [...filtered].sort((a, b) => String(b.completed_at).localeCompare(String(a.completed_at)));
+  }
+
+  filtered = tasks.filter((task) => task.status === 'active');
+  if (app.filter === 'mine') filtered = filtered.filter((task) => task.can_complete);
+  if (app.filter === 'shared') filtered = filtered.filter((task) => task.mode === 'shared');
+  if (app.filter === 'open') filtered = filtered.filter((task) => task.mode === 'open');
+
+  return [...filtered].sort((a, b) => {
+    if (a.can_complete !== b.can_complete) return a.can_complete ? -1 : 1;
+    return String(b.created_at).localeCompare(String(a.created_at));
+  });
+}
+
+function filterCount(key) {
+  const active = app.data.tasks.filter((task) => task.status === 'active');
+  if (key === 'done') return app.data.tasks.length - active.length;
+  if (key === 'mine') return active.filter((task) => task.can_complete).length;
+  if (key === 'shared') return active.filter((task) => task.mode === 'shared').length;
+  if (key === 'open') return active.filter((task) => task.mode === 'open').length;
+  return active.length;
+}
+
+function renderBoard() {
+  const me = currentUser();
+  const activeTasks = app.data.tasks.filter((task) => task.status === 'active');
+  const actionable = activeTasks.filter((task) => task.can_complete);
+  const myWins = app.data.completions.filter((item) => item.user_id === me.id);
+  const recentWins = myWins.slice(0, 3);
+  const onlineUsers = app.data.users.filter((user) => app.data.onlineUserIds.includes(user.id));
+  const visible = getFilteredTasks();
+
+  const filters = [
+    { key: 'active', label: 'Faol' },
+    { key: 'mine', label: 'Menga' },
+    { key: 'shared', label: 'Birgalikda' },
+    { key: 'open', label: 'Hamma uchun' },
+    { key: 'done', label: 'Bajarilgan' },
+  ].map((filter) => `
+    <button class="filter-chip ${app.filter === filter.key ? 'is-active' : ''}" type="button" data-action="set-filter" data-filter="${filter.key}">
+      ${esc(filter.label)}
+      <span>${filterCount(filter.key)}</span>
+    </button>
+  `).join('');
+
+  let intro;
+  if (actionable.length > 0) {
+    intro = `Sizni <strong>${actionable.length} ta vazifa</strong> kutmoqda. Birinchi bo‘lib bajaring — <strong>1 ball</strong> va yana bitta kichik g‘alaba sizniki bo‘ladi.`;
+  } else if (activeTasks.length > 0) {
+    intro = 'Bugun hamma band. Siz ham birovga kichik bir yaxshilik tashlab, kunini yorqinroq qilishingiz mumkin.';
+  } else {
+    intro = 'Hozircha vazifalar yo‘q. Birinchi bo‘lib kimningdir kuniga kichik bir quvonch tashlang.';
+  }
+
+  const filterEmpty = emptyTaskState();
+
+  return `
+    <section class="view view--board">
+      <section class="board-hero">
+        <div class="hero-copy">
+          <p class="eyebrow"><span class="eyebrow-line"></span> ${esc(todayLabel())}</p>
+          <h1>Salom, <em>${esc(getFirstName(me.display_name))}</em>.<br>Kimning kunini <span class="highlight-word">yorqinroq</span> qilamiz?</h1>
+          <p class="hero-lede">${intro}</p>
+          <div class="hero-actions">
+            <button class="button button--primary" type="button" data-action="open-create">
+              <span>Vazifa tashlash</span>
+              <span class="button-arrow">${icon('arrow-up-right')}</span>
+            </button>
+            <a class="button button--ghost" href="#/people">Yuraklarni ko‘rish ${icon('arrow-right')}</a>
+          </div>
+          <p class="hero-footnote">${icon('heart')} Birinchi bo‘lgan 1 ball oladi. Qolgani — birgalikda o‘tkazilgan vaqt.</p>
+        </div>
+        <aside class="score-ticket" aria-label="Sizning hisobingiz">
+          <span class="ticket-serial">LOVE CLUB · ${esc(String(me.points).padStart(3, '0'))}</span>
+          <span class="score-ticket-label">sevgi hisobi</span>
+          <div class="score-main">
+            <span class="score-number">${me.points}</span>
+            <span class="score-unit">ball</span>
+          </div>
+          <div class="score-divider"></div>
+          <div class="score-stats">
+            <div class="score-stat">
+              <strong>${me.completed_count}</strong>
+              <span>g‘alaba</span>
+            </div>
+            <div class="score-stat">
+              <strong>${actionable.length}</strong>
+              <span>kutayotgan</span>
+            </div>
+          </div>
+          <span class="ticket-heart" aria-hidden="true">♥</span>
+        </aside>
+      </section>
+
+      <div class="love-ticker" aria-hidden="true">
+        <div class="love-ticker-track">
+          <span>BIRINCHI BO‘L</span><span class="ticker-star">✦</span>
+          <span class="ticker-ball">+1 BALL</span><span class="ticker-star">✦</span>
+          <span>YURAKNI XURSAND QIL</span><span class="ticker-star">✦</span>
+          <span>BIRGALIKDA O‘YNA</span><span class="ticker-star">✦</span>
+          <span>KICHIK VAZIFALAR</span><span class="ticker-star">✦</span>
+          <span class="ticker-ball">KATTA HISLAR</span><span class="ticker-star">✦</span>
+          <span>BIRINCHI BO‘L</span><span class="ticker-star">✦</span>
+          <span class="ticker-ball">+1 BALL</span><span class="ticker-star">✦</span>
+          <span>YURAKNI XURSAND QIL</span><span class="ticker-star">✦</span>
+          <span>BIRGALIKDA O‘YNA</span><span class="ticker-star">✦</span>
+          <span>KICHIK VAZIFALAR</span><span class="ticker-star">✦</span>
+          <span class="ticker-ball">KATTA HISLAR</span><span class="ticker-star">✦</span>
+        </div>
+      </div>
+
+      <div class="board-grid">
+        <section class="feed-column" aria-labelledby="tasksHeading">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Bugungi reja</p>
+              <h2 id="tasksHeading">Vazifalar oqimi</h2>
+            </div>
+            <span class="section-count"><strong>${visible.length}</strong> ta vazifa</span>
+          </div>
+
+          <div class="filter-row" role="group" aria-label="Vazifalarni filtrlash">
+            ${filters}
+          </div>
+
+          <div class="task-list">
+            ${visible.length ? visible.map((task) => taskCardHtml(task)).join('') : filterEmpty}
+          </div>
+        </section>
+
+        <aside class="board-side">
+          <section class="side-card side-card--dark online-card">
+            <div class="side-card-head">
+              <span class="side-label">Hozir shu yerda</span>
+              <span class="live-label">live</span>
+            </div>
+            <div class="online-stack" data-online-faces>
+              ${avatarStackHtml(onlineUsers, 5)}
+            </div>
+            <p class="online-copy" data-online-copy>${onlineCopyHtml(onlineUsers.length)}</p>
+          </section>
+
+          <section class="side-card wins-card">
+            <div class="side-card-head">
+              <span class="side-label">Mening izlarim</span>
+              <a class="side-link" href="#/me">Barchasi ↗</a>
+            </div>
+            ${recentWins.length ? `
+              <div class="wins-list">
+                ${recentWins.map((win) => `
+                  <div class="win-mini">
+                    <span class="win-mini-check">${icon('check')}</span>
+                    <div class="win-mini-copy">
+                      <strong>${esc(win.task_title)}</strong>
+                      <span>${esc(timeAgo(win.completed_at))}</span>
+                    </div>
+                    <span class="win-mini-points">+${win.points}</span>
+                  </div>
+                `).join('')}
+              </div>
+            ` : `
+              <p class="wins-empty">Hali birinchi g‘alabangiz yo‘q. Oqimdan o‘zingizga mos vazifani tanlang.</p>
+              <button class="link-button" type="button" data-action="set-filter" data-filter="mine">Vazifalarni ko‘rish ${icon('arrow-right')}</button>
+            `}
+          </section>
+
+          <section class="side-card rules-card">
+            <div class="side-card-head">
+              <span class="side-label">Qanday o‘ynaladi?</span>
+            </div>
+            <ol class="rules-list">
+              <li><span><strong>Tanlang.</strong> Birovga yoki hammaga kichik vazifa tashlang.</span></li>
+              <li><span><strong>Birinchi bo‘ling.</strong> Boshqalar tashlagan vazifani birinchi bo‘lib bajaring.</span></li>
+              <li><span><strong>Ball yig‘ing.</strong> Har bir g‘alaba uchun +1 ball. Profilingizda tarix qoladi.</span></li>
+            </ol>
+            <p class="rules-foot">O‘z vazifangizni o‘zingiz bajara olmaysiz. Sevgi ham, o‘yin ham adolatli bo‘lsin.</p>
+          </section>
+        </aside>
+      </div>
+    </section>
+  `;
+}
+
+function emptyTaskState() {
+  if (app.filter === 'done') {
+    return `
+      <div class="empty-state tasks-empty">
+        <span class="empty-state-icon">${icon('check')}</span>
+        <h3>Hali g‘alabalar yo‘q.</h3>
+        <p>Birinchi bo‘lib bajarilgan vazifa shu yerda porlaydi. Ochiq vazifalardan boshlang.</p>
+        <button class="button button--primary" type="button" data-action="set-filter" data-filter="active">Faol vazifalarni ko‘rish ${icon('arrow-right')}</button>
+      </div>
+    `;
+  }
+
+  if (app.filter === 'mine') {
+    return `
+      <div class="empty-state tasks-empty">
+        <span class="empty-state-icon">${icon('heart-line')}</span>
+        <h3>Hozircha sizga vazifa yo‘q.</h3>
+        <p>Do‘stlaringizni taklif qiling yoki boshqalar tashlagan ochiq vazifalardan birini birinchi bo‘lib bajaring.</p>
+        <button class="button button--primary" type="button" data-action="set-filter" data-filter="active">Barcha vazifalar ${icon('arrow-right')}</button>
+      </div>
+    `;
+  }
+
+  if (app.filter === 'shared' || app.filter === 'open') {
+    return `
+      <div class="empty-state tasks-empty">
+        <span class="empty-state-icon">${icon(app.filter === 'shared' ? 'users' : 'globe')}</span>
+        <h3>${app.filter === 'shared' ? 'Birgalikda hali jimlik.' : 'Ochiq vazifalar yo‘q.'}</h3>
+        <p>Birinchi bo‘lib shunday vazifa tashlang. Kim birinchi bajarishini birga tomosha qilamiz.</p>
+        <button class="button button--primary" type="button" data-action="open-create" data-create-mode="${app.filter}">Vazifa tashlash ${icon('plus')}</button>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="empty-state tasks-empty">
+      <span class="empty-state-icon">${icon('sparkle')}</span>
+      <h3>Hozircha hech kim vazifa tashlamagan.</h3>
+      <p>Birinchi bo‘ling. Kimningdir kunini yorqinroq qiladigan kichik bir vazifa yetarli.</p>
+      <button class="button button--primary" type="button" data-action="open-create">Birinchi vazifani tashlash ${icon('plus')}</button>
+    </div>
+  `;
+}
+
+function taskCardHtml(task) {
+  const mode = modeMeta(task.mode);
+  const category = categoryMeta(task.category);
+  const participants = task.participants || [];
+  const isCompleted = task.status === 'completed';
+  const creator = task.creator;
+  const firstParticipant = participants[0] || null;
+
+  let recipientMarkup = '';
+  if (task.mode === 'open') {
+    recipientMarkup = `
+      <span class="route-audience">${icon('globe')} Barcha yuraklar</span>
+    `;
+  } else if (task.mode === 'solo') {
+    recipientMarkup = firstParticipant
+      ? `<span class="route-more">${esc(firstParticipant.display_name)} uchun</span>`
+      : '<span class="route-more">Yurak tanlanmagan</span>';
+  } else {
+    recipientMarkup = `${avatarStackHtml(participants, 3)}<span class="route-more">${participants.length} ishtirokchi</span>`;
+  }
+
+  const tags = [
+    `<span class="task-tag">${category.emoji} ${esc(category.label)}</span>`,
+    task.due_date ? `<span class="task-tag">${icon('calendar')} ${esc(dueLabel(task.due_date))}</span>` : '',
+    !isCompleted ? `<span class="task-tag task-tag--prize">${task.mode === 'solo' ? '+1 ball' : '1-bajargan +1'}</span>` : '',
+  ].filter(Boolean).join('');
+
+  let footer = '';
+  if (isCompleted) {
+    const completer = task.completer || {
+      id: null,
+      display_name: 'O‘chirilgan yurak',
+      emoji: '🕊️',
+      accent: '#8a7770',
+    };
+    footer = `
+      <div class="winner-line">
+        ${avatarHtml(completer, 'sm')}
+        <div class="winner-copy">
+          <strong>${esc(completer.display_name)}</strong>
+          <span>birinchi bo‘lib bajardi · ${esc(timeAgo(task.completed_at))}</span>
+        </div>
+      </div>
+      <span class="task-completed-mark">${icon('check')} yakunlangan</span>
+    `;
+  } else if (task.can_complete) {
+    footer = `
+      <div class="task-action">
+        <button class="button button--complete" type="button" data-action="complete-task" data-task-id="${esc(task.id)}">
+          <span>Bajardim</span>
+          <span class="prize-pill">+1</span>
+        </button>
+        <p class="task-action-hint">
+          ${task.mode === 'solo'
+            ? 'Shaxsiy vazifa. Bajarilishi bilan ball sizniki.'
+            : 'Birinchi bo‘lib bajaring — ball va g‘alaba sizniki.'}
+        </p>
+      </div>
+    `;
+  } else if (task.is_creator) {
+    footer = `
+      <span class="task-status-note">${icon('lock')} <strong>Siz tashlagansiz.</strong> Boshqalar bajarishini kuting.</span>
+    `;
+  } else if (task.mode === 'shared') {
+    footer = `
+      <span class="task-status-note">${icon('users')} <strong>Faqat ishtirokchilar uchun.</strong> Bu vazifada siz tanlanmagansiz.</span>
+    `;
+  } else {
+    const targetName = firstParticipant ? firstParticipant.display_name : 'boshqa yurak';
+    footer = `
+      <span class="task-status-note">${icon('lock')} <strong>Shaxsiy vazifa.</strong> Faqat ${esc(targetName)} bajarishi mumkin.</span>
+    `;
+  }
+
+  const deleteButton = task.can_delete
+    ? `<button class="icon-button task-delete" type="button" data-action="delete-task" data-task-id="${esc(task.id)}" title="Vazifani o‘chirish" aria-label="Vazifani o‘chirish">${icon('trash')}</button>`
+    : '';
+
+  return `
+    <article class="task-card ${isCompleted ? 'is-completed' : ''}" style="--task-accent:${safeAccent(creator.accent)}">
+      <div class="task-card-top">
+        <span class="mode-badge mode-badge--${esc(task.mode)}">${icon(mode.icon)} ${esc(mode.label)}</span>
+        <span class="task-number">${taskSerial(task.id)}</span>
+      </div>
+      <div class="task-title-row">
+        <h3>${esc(task.title)}</h3>
+        ${deleteButton}
+      </div>
+      ${task.description ? `<p class="task-description">${esc(task.description)}</p>` : ''}
+      <div class="task-route">
+        <div class="route-person">
+          ${avatarHtml(creator, 'sm')}
+          <div class="route-text">
+            <span class="route-label">tashlagan</span>
+            <span class="route-name">${esc(creator.display_name)}</span>
+          </div>
+        </div>
+        <span class="route-arrow">${icon('arrow-right')}</span>
+        <div class="route-recipients">
+          ${recipientMarkup}
+        </div>
+      </div>
+      <div class="task-tags">${tags}</div>
+      <div class="task-footer">${footer}</div>
+    </article>
+  `;
+}
+
+/* --------------------------------------------------------------------------
+   Yuraklar
+   -------------------------------------------------------------------------- */
+
+function renderPeople() {
+  const me = currentUser();
+  const onlineCount = app.data.onlineUserIds.length;
+  const cards = app.data.users.map((user, index) => {
+    const rank = index + 1;
+    const online = isUserOnline(user.id);
+    const isMe = user.id === me.id;
+    const points = user.points;
+    return `
+      <a class="person-card ${isMe ? 'is-me' : ''} ${rank <= 3 && points > 0 ? 'is-top' : ''}"
+         href="${profileHref(user.id)}"
+         style="--person-accent:${safeAccent(user.accent)}"
+         aria-label="${esc(user.display_name)} profili">
+        <span class="person-topline">
+          <span class="person-rank">${rank === 1 && points > 0 ? icon('crown') : ''} № ${String(rank).padStart(2, '0')}</span>
+          ${onlineLabelHtml(user.id)}
+        </span>
+        <div class="person-main">
+          <div class="person-avatar-wrap">
+            ${avatarHtml(user, 'lg')}
+            ${online ? '<span class="avatar-online" title="Onlayn"></span>' : ''}
+            ${isMe ? '<span class="person-you">Siz</span>' : ''}
+          </div>
+          <h2>${esc(user.display_name)}</h2>
+          <span class="person-username">@${esc(user.username)}</span>
+          <p class="person-bio">${esc(user.bio || 'Hali o‘zi haqida biror so‘z yozmagan. Sirli yurak.')}</p>
+          <div class="person-stats">
+            <span class="person-stat"><strong>${points}</strong><span>ball</span></span>
+            <span class="person-stat"><strong>${user.completed_count}</strong><span>g‘alaba</span></span>
+            <span class="person-open">Profil ${icon('arrow-up-right')}</span>
+          </div>
+        </div>
+      </a>
+    `;
+  }).join('');
+
+  return `
+    <section class="view view--people">
+      <header class="people-intro">
+        <div class="people-intro-copy">
+          <p class="eyebrow"><span class="eyebrow-line"></span> Yuraklar xaritasi</p>
+          <h1>Yuraklar <em>bog‘i.</em></h1>
+          <p>Har bir profil — kichik bir hikoya. Kimning qanday g‘alabalari borligini ko‘ring, ilhom oling va birovning kuniga kichik bir vazifa tashlang.</p>
+        </div>
+        <aside class="invite-stub">
+          <p class="eyebrow">Birga o‘ynang</p>
+          <h3>Do‘stingizni olib keling.</h3>
+          <p>Bog‘ qancha boy bo‘lsa, vazifalar shuncha qiziqarli bo‘ladi.</p>
+          <button class="link-button" type="button" data-action="copy-invite">Havolani nusxalash ${icon('copy')}</button>
+        </aside>
+      </header>
+
+      <div class="people-meta">
+        <span><strong>${app.data.users.length}</strong> ta yurak bog‘da</span>
+        <span class="people-meta-note">${icon('sparkle')} <span data-online-count>${onlineCount}</span> kishi hozir onlayn</span>
+      </div>
+
+      <div class="people-grid">
+        ${cards}
+      </div>
+
+      <p class="people-note">${icon('heart')} Siz ham shu bog‘ning bir qismisiz. Profilingizni oching — u yerda barcha g‘alabalaringiz saqlanadi.</p>
+    </section>
+  `;
+}
+
+/* --------------------------------------------------------------------------
+   Profil
+   -------------------------------------------------------------------------- */
+
+function renderProfile(user) {
+  const me = currentUser();
+  const isMe = user.id === me.id;
+  const online = isUserOnline(user.id);
+  const rank = userRank(user.id);
+  const completions = app.data.completions.filter((item) => item.user_id === user.id);
+  const activeAssigned = app.data.tasks.filter((task) => (
+    task.status === 'active'
+    && task.creator.id !== user.id
+    && (task.participant_ids || []).includes(user.id)
+  ));
+
+  const history = completions.length
+    ? completions.map((completion) => {
+        const stamp = dateStamp(completion.completed_at);
+        const mode = modeMeta(completion.task_mode);
+        const category = categoryMeta(completion.task_category);
+        return `
+          <article class="history-item">
+            <div class="history-date">
+              <strong>${esc(stamp.day)}</strong>
+              <span>${esc(stamp.month)}</span>
+            </div>
+            <div class="history-copy">
+              <h3>${esc(completion.task_title)}</h3>
+              <p>
+                <span>${esc(completion.creator_name)} tashlagan</span>
+                <span>${category.emoji} ${esc(category.label)}</span>
+                <span>${esc(mode.label)}</span>
+                <span>${esc(timeAgo(completion.completed_at))}</span>
+              </p>
+            </div>
+            <span class="history-points">+${completion.points}<small>ball</small></span>
+          </article>
+        `;
+      }).join('')
+    : `
+      <div class="history-empty">
+        ${icon('heart-line')}
+        <p>${isMe ? 'Hali birinchi g‘alabangiz yozilmagan. Oqimdan boshlang.' : `${esc(getFirstName(user.display_name))} hali birinchi g‘alabasini yozmagan.`}</p>
+        ${isMe
+          ? `<button class="button button--tiny button--ghost" type="button" data-action="go-mine" style="margin-top:12px">Menga mos vazifalar ${icon('arrow-right')}</button>`
+          : `<button class="button button--tiny button--ghost" type="button" data-action="open-create" data-target-id="${esc(user.id)}" style="margin-top:12px">Vazifa tashlash ${icon('plus')}</button>`}
+      </div>
+    `;
+
+  const assigned = activeAssigned.length
+    ? `<div class="assigned-grid">
+        ${activeAssigned.map((task) => `
+          <div class="assigned-card">
+            <strong>${esc(task.title)}</strong>
+            <span>${esc(task.creator.display_name)} tashlagan · ${task.mode === 'solo' ? 'shaxsiy' : 'birgalikda'}</span>
+          </div>
+        `).join('')}
+      </div>`
+    : `<p class="assigned-empty">${isMe ? 'Hozircha sizga tashlangan faol vazifa yo‘q.' : 'Hozircha unga tashlangan faol vazifa yo‘q.'}</p>`;
+
+  const actionButtons = isMe
+    ? `
+      <button class="button button--ink" type="button" data-action="edit-profile">${icon('edit')} Profilni tahrirlash</button>
+      <button class="button button--ghost" type="button" data-action="copy-invite">${icon('copy')} Do‘st taklif qilish</button>
+    `
+    : `
+      <button class="button button--ink" type="button" data-action="open-create" data-target-id="${esc(user.id)}">${icon('send')} Vazifa tashlash</button>
+      <button class="button button--ghost" type="button" data-action="copy-invite">${icon('copy')} Havolani ulashish</button>
+    `;
+
+  const danger = isMe
+    ? `
+      <section class="danger-zone">
+        <div class="danger-copy">
+          <p class="eyebrow">Xavfli hudud</p>
+          <h2>Akkauntni butunlay o‘chirish</h2>
+          <p>Profilingiz, siz yaratgan vazifalar va shaxsiy natijalaringiz o‘chiriladi. Boshqa odamlarning tarixiy g‘alaba yozuvlari saqlanadi. Bu amalni ortga qaytarib bo‘lmaydi.</p>
+        </div>
+        <button class="button button--danger-ghost" type="button" data-action="delete-account">${icon('trash')} Akkauntni o‘chirish</button>
+      </section>
+    `
+    : '';
+
+  return `
+    <section class="view view--profile">
+      <a class="back-link" href="#/people">${icon('chevron-left')} Yuraklarga qaytish</a>
+
+      <div class="profile-layout">
+        <aside class="profile-passport" style="--profile-accent:${safeAccent(user.accent)}">
+          <span class="profile-tape" aria-hidden="true"></span>
+          <div class="profile-passport-head">
+            <span>${isMe ? 'Sizning yurak daftaringiz' : 'Yurak daftari'} · ${esc(user.username)}</span>
+            ${onlineLabelHtml(user.id)}
+          </div>
+
+          <div class="profile-avatar-wrap">
+            ${avatarHtml(user, 'xl')}
+            <span class="profile-avatar-ring" aria-hidden="true"></span>
+            ${online ? '<span class="avatar-online" title="Onlayn"></span>' : ''}
+          </div>
+
+          <p class="eyebrow profile-eyebrow">${isMe ? 'Bu siz' : `${String(rank).padStart(2, '0')}-o‘rin`}</p>
+          <h1>${esc(user.display_name)}</h1>
+          <p class="profile-username">@${esc(user.username)}</p>
+          <p class="profile-bio">${esc(user.bio || 'Hali o‘zi haqida biror so‘z yozmagan. Balki siri shunda.')}</p>
+
+          <div class="profile-numbers">
+            <div class="profile-number">
+              <strong>${user.points}</strong>
+              <span>ball</span>
+            </div>
+            <div class="profile-number">
+              <strong>${user.completed_count}</strong>
+              <span>g‘alaba</span>
+            </div>
+          </div>
+
+          <dl class="profile-meta">
+            <div><dt>Qo‘shilgan</dt><dd>${esc(fullDate(user.created_at))}</dd></div>
+            <div><dt>Reyting</dt><dd>#${rank} / ${app.data.users.length}</dd></div>
+            <div><dt>Holat</dt><dd>${onlineLabelHtml(user.id)}</dd></div>
+          </dl>
+
+          <div class="profile-actions">
+            ${actionButtons}
+          </div>
+
+          <p class="passport-note">${isMe ? 'Har bir g‘alaba shu daftarda qoladi.' : 'Kichik vazifalar, katta hislar.'}</p>
+        </aside>
+
+        <div class="profile-main">
+          <section class="profile-section">
+            <div class="profile-section-head">
+              <div>
+                <p class="eyebrow">Yozib qo‘yilgan g‘alabalar</p>
+                <h2>Bajarilgan vazifalar</h2>
+              </div>
+              <span class="section-count"><strong>${completions.length}</strong> ta</span>
+            </div>
+            <div class="history-list">
+              ${history}
+            </div>
+          </section>
+
+          <section class="profile-section">
+            <div class="profile-section-head">
+              <div>
+                <p class="eyebrow">Hozir qo‘lda</p>
+                <h2>Faol vazifalar</h2>
+              </div>
+              <span class="section-count"><strong>${activeAssigned.length}</strong> ta</span>
+            </div>
+            ${assigned}
+          </section>
+
+          ${danger}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderMissingProfile() {
+  return `
+    <section class="view profile-not-found">
+      <span class="empty-state-icon">${icon('heart-line')}</span>
+      <h1>Bu yurak topilmadi.</h1>
+      <p>Ehtimol, profil o‘chirilgan yoki manzil biroz xato.</p>
+      <a class="button button--primary" href="#/people">Yuraklar bog‘iga qaytish ${icon('arrow-right')}</a>
+    </section>
+  `;
+}
