@@ -232,10 +232,16 @@ function initial(value) {
 
 function avatarHtml(user, size = 'md') {
   const person = user || {};
-  return `
-    <span class="avatar avatar--${esc(size)}" style="--accent:${safeAccent(person.accent)}" aria-hidden="true">
-      <span class="avatar-emoji">${esc(safeEmoji(person.emoji))}</span>
-    </span>`;
+  const hasImage = person.avatar_url;
+  return hasImage
+    ? `
+      <span class="avatar avatar--${esc(size)}" style="--accent:${safeAccent(person.accent)}" aria-hidden="true">
+        <img class="avatar-image" src="${esc(person.avatar_url)}" alt="">
+      </span>`
+    : `
+      <span class="avatar avatar--${esc(size)}" style="--accent:${safeAccent(person.accent)}" aria-hidden="true">
+        <span class="avatar-emoji">${esc(safeEmoji(person.emoji))}</span>
+      </span>`;
 }
 
 function avatarWrapHtml(user, size = 'md', online = false) {
@@ -506,6 +512,26 @@ async function copyInvite() {
   } catch {
     toast('Havolani nusxalab bo‘lmadi', 'Manzilni qo‘lda nusxalang: ' + location.origin, 'error');
   }
+}
+
+/* --------------------------------------------------------------------------
+   Rasm yuklash yordamchilari
+   -------------------------------------------------------------------------- */
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(new Error('Fayl o‘qilmadi'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function validateImageFile(file, { maxBytes, acceptTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'] } = {}) {
+  if (!file) return { ok: false, error: 'Fayl tanlanmagan.' };
+  if (!acceptTypes.includes(file.type)) return { ok: false, error: 'Ruxsat etilgan formatlar: JPEG, PNG, WebP, GIF.' };
+  if (file.size > maxBytes) return { ok: false, error: `Hajm ${maxBytes / 1024 / 1024} MB dan oshmasligi kerak.` };
+  return { ok: true };
 }
 
 /* --------------------------------------------------------------------------

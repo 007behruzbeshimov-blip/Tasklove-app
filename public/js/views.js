@@ -26,6 +26,9 @@ function renderApp() {
       html = renderMissingProfile();
       title = 'Yurak topilmadi — tasklove.';
     }
+  } else if (route.name === 'chat') {
+    html = renderChat();
+    title = 'Suhbatlar — tasklove.';
   } else {
     html = renderBoard();
   }
@@ -33,6 +36,11 @@ function renderApp() {
   dom.viewRoot.innerHTML = html;
   document.title = title;
   updatePresenceUI();
+  
+  // Initialize chat if on chat page
+  if (route.name === 'chat') {
+    initChat();
+  }
 }
 
 function renderHeader() {
@@ -51,12 +59,16 @@ function renderHeader() {
   if (headerAvatar) {
     headerAvatar.className = 'avatar avatar--xs';
     headerAvatar.style.setProperty('--accent', safeAccent(me.accent));
-    headerAvatar.innerHTML = `<span class="avatar-emoji">${esc(safeEmoji(me.emoji))}</span>`;
+    headerAvatar.innerHTML = me.avatar_url
+      ? `<img class="avatar-image" src="${esc(me.avatar_url)}" alt="">`
+      : `<span class="avatar-emoji">${esc(safeEmoji(me.emoji))}</span>`;
   }
   if (mobileAvatar) {
     mobileAvatar.className = 'avatar avatar--mobile';
     mobileAvatar.style.setProperty('--accent', safeAccent(me.accent));
-    mobileAvatar.innerHTML = `<span class="avatar-emoji">${esc(safeEmoji(me.emoji))}</span>`;
+    mobileAvatar.innerHTML = me.avatar_url
+      ? `<img class="avatar-image" src="${esc(me.avatar_url)}" alt="">`
+      : `<span class="avatar-emoji">${esc(safeEmoji(me.emoji))}</span>`;
   }
   if (headerProfile) headerProfile.setAttribute('href', '#/me');
   if (mobileProfile) mobileProfile.setAttribute('href', '#/me');
@@ -67,6 +79,7 @@ function updateNav() {
   let active = 'board';
   if (route.name === 'people') active = 'people';
   else if (route.name === 'profile') active = route.self ? 'me' : 'people';
+  else if (route.name === 'chat') active = 'chat';
 
   document.querySelectorAll('.desktop-nav [data-nav]').forEach((link) => {
     link.classList.toggle('is-active', link.dataset.nav === active && active !== 'me');
@@ -383,6 +396,16 @@ function taskCardHtml(task) {
       emoji: '🕊️',
       accent: '#8a7770',
     };
+    const proofHtml = task.proof_url
+      ? `
+        <div class="task-proof">
+          <a class="task-proof-link" href="${esc(task.proof_url)}" target="_blank" rel="noopener">
+            <span class="task-proof-thumb"><img src="${esc(task.proof_url)}" alt="Dalil rasmi" loading="lazy"></span>
+            <span>${icon('image')} Dalil rasmi</span>
+          </a>
+        </div>
+      `
+      : '';
     footer = `
       <div class="winner-line">
         ${avatarHtml(completer, 'sm')}
@@ -391,6 +414,7 @@ function taskCardHtml(task) {
           <span>birinchi bo‘lib bajardi · ${esc(timeAgo(task.completed_at))}</span>
         </div>
       </div>
+      ${proofHtml}
       <span class="task-completed-mark">${icon('check')} yakunlangan</span>
     `;
   } else if (task.can_complete) {
@@ -547,6 +571,16 @@ function renderProfile(user) {
         const stamp = dateStamp(completion.completed_at);
         const mode = modeMeta(completion.task_mode);
         const category = categoryMeta(completion.task_category);
+        const proofHtml = completion.proof_url
+          ? `
+            <div class="history-proof">
+              <a class="history-proof-thumb" href="${esc(completion.proof_url)}" target="_blank" rel="noopener">
+                <img src="${esc(completion.proof_url)}" alt="Dalil rasmi" loading="lazy">
+              </a>
+              <a class="history-proof-link" href="${esc(completion.proof_url)}" target="_blank" rel="noopener">${icon('image')} Dalilni ochish</a>
+            </div>
+          `
+          : '';
         return `
           <article class="history-item">
             <div class="history-date">
@@ -561,6 +595,7 @@ function renderProfile(user) {
                 <span>${esc(mode.label)}</span>
                 <span>${esc(timeAgo(completion.completed_at))}</span>
               </p>
+              ${proofHtml}
             </div>
             <span class="history-points">+${completion.points}<small>ball</small></span>
           </article>
@@ -648,6 +683,7 @@ function renderProfile(user) {
             <div><dt>Qo‘shilgan</dt><dd>${esc(fullDate(user.created_at))}</dd></div>
             <div><dt>Reyting</dt><dd>#${rank} / ${app.data.users.length}</dd></div>
             <div><dt>Holat</dt><dd>${onlineLabelHtml(user.id)}</dd></div>
+            <div><dt>Oxirgi kirish</dt><dd>${lastSeenHtml(user)}</dd></div>
           </dl>
 
           <div class="profile-actions">
@@ -698,4 +734,223 @@ function renderMissingProfile() {
       <a class="button button--primary" href="#/people">Yuraklar bog‘iga qaytish ${icon('arrow-right')}</a>
     </section>
   `;
+}
+
+/* --------------------------------------------------------------------------
+   Chat / Suhbatlar
+   -------------------------------------------------------------------------- */
+
+function renderChat() {
+  const me = currentUser();
+  const onlineUsers = app.data.onlineUserIds ? new Set(app.data.onlineUserIds) : new Set();
+  
+  // Chat list HTML
+  let chatListHtml = `
+    <div class="chat-header">
+      <h2>${icon('chat')} Suhbatlar</h2>
+      <div class="chat-search">
+        ${icon('search')}
+        <input type="text" placeholder="Izlash..." data-chat-search>
+      </div>
+    </div>
+    <div class="chat-list" data-chat-list>
+      <div class="chat-item is-general ${app.chat?.active === 'general' ? 'is-active' : ''}" data-chat-target="general">
+        <div class="chat-item-avatar">
+          <span class="avatar avatar--md" style="--accent:#b84a5f" aria-hidden="true">
+            <span class="avatar-emoji">${icon('users')}</span>
+          </span>
+        </div>
+        <div class="chat-item-meta">
+          <span class="chat-item-name">Umumiy suhbat</span>
+          <span class="chat-item-preview">${app.chat?.general?.last_message ? (app.chat.general.last_message.mine ? 'Siz: ' : '') + esc(app.chat.general.last_message.body) : 'Xabarlar yo‘q'}</span>
+        </div>
+        <span class="chat-item-time">${app.chat?.general?.last_message ? esc(timeAgo(app.chat.general.last_message.created_at)) : ''}</span>
+      </div>
+      <div class="chat-divider"></div>
+      ${(app.chat?.directs || []).map((conv) => {
+        const user = conv.user;
+        const isOnline = onlineUsers.has(user.id);
+        const last = conv.last_message;
+        return `
+          <a class="chat-item ${app.chat?.active === user.id ? 'is-active' : ''}" data-chat-target="${esc(user.id)}" href="#/chat/${esc(user.id)}">
+            <div class="chat-item-avatar">
+              ${avatarHtml(user, 'md')}
+              ${isOnline ? '<span class="chat-item-online" title="Onlayn"></span>' : ''}
+            </div>
+            <div class="chat-item-meta">
+              <span class="chat-item-name">${esc(user.display_name)}</span>
+              <span class="chat-item-preview">${last ? (last.mine ? 'Siz: ' : '') + esc(last.body) : 'Xabarlar yo‘q'}</span>
+            </div>
+            <span class="chat-item-time">${last ? esc(timeAgo(last.created_at)) : ''}</span>
+          </a>
+        `;
+      }).join('')}
+    </div>
+  `;
+
+  // Chat thread HTML
+  let threadHtml = '';
+  const activeTarget = app.chat?.active || 'general';
+  const isGeneral = activeTarget === 'general';
+  const messages = app.chat?.messages || [];
+  const targetUser = isGeneral ? null : (app.chat?.directs || []).find((c) => c.user.id === activeTarget)?.user || null;
+
+  if (!app.chat || app.chat.loading) {
+    threadHtml = `
+      <div class="chat-thread">
+        <div class="chat-thread-header">
+          <button class="icon-button chat-sidebar-toggle" type="button" data-action="chat-sidebar-toggle" aria-label="Suhbatlar ro‘yxati">${icon('chevron-left')}</button>
+          ${isGeneral ? `
+            <div class="chat-thread-avatar">
+              <span class="avatar avatar--md" style="--accent:#b84a5f" aria-hidden="true"><span class="avatar-emoji">${icon('users')}</span></span>
+            </div>
+            <div class="chat-thread-info">
+              <span class="chat-thread-title">Umumiy suhbat</span>
+              <span class="chat-thread-status">Hammaga ochiq</span>
+            </div>
+          ` : `
+            <div class="chat-thread-avatar">${avatarHtml(targetUser, 'md')}${targetUser && isUserOnline(targetUser.id) ? '<span class="avatar-online" title="Onlayn"></span>' : ''}</div>
+            <div class="chat-thread-info">
+              <span class="chat-thread-title">${esc(targetUser?.display_name || 'Yuklanmoqda...')}</span>
+              <span class="chat-thread-status ${targetUser && isUserOnline(targetUser.id) ? 'online' : ''}">${targetUser && isUserOnline(targetUser.id) ? 'onlayn' : (targetUser ? 'oflayn' : 'yuklanmoqda...')}</span>
+            </div>
+          `}
+        </div>
+        <div class="chat-messages">
+          <div class="chat-empty-state">
+            <span class="icon">${icon(isGeneral ? 'users' : 'chat')}</span>
+            <h3>Xabarlar yuklanmoqda...</h3>
+          </div>
+        </div>
+        <form class="chat-composer" data-chat-form>
+          <div class="chat-composer-form">
+            <div class="chat-composer-input-wrapper">
+              <textarea class="chat-composer-input" placeholder="${isGeneral ? 'Hammaga xabar yozing...' : `${esc(targetUser?.display_name || '')}ga xabar yozing...`}" data-chat-input rows="1"></textarea>
+            </div>
+            <button class="chat-composer-send" type="submit" disabled>${icon('send')}</button>
+          </div>
+        </form>
+      </div>
+    `;
+  } else if (isGeneral) {
+    threadHtml = `
+      <div class="chat-thread">
+        <div class="chat-thread-header">
+          <button class="icon-button chat-sidebar-toggle" type="button" data-action="chat-sidebar-toggle" aria-label="Suhbatlar ro‘yxati">${icon('chevron-left')}</button>
+          <div class="chat-thread-avatar">
+            <span class="avatar avatar--md" style="--accent:#b84a5f" aria-hidden="true"><span class="avatar-emoji">${icon('users')}</span></span>
+          </div>
+          <div class="chat-thread-info">
+            <span class="chat-thread-title">Umumiy suhbat</span>
+            <span class="chat-thread-status">Hammaga ochiq · ${app.data.users.length - 1} ta yurak</span>
+          </div>
+        </div>
+        <div class="chat-messages" data-chat-messages>
+          ${messages.length ? messages.map((msg) => renderChatMessage(msg)).join('') : `
+            <div class="chat-empty-state">
+              <span class="icon">${icon('users')}</span>
+              <h3>Hozircha xabarlar yo‘q</h3>
+              <p>Birinchi bo‘lib salom bering! Barcha ishtirokchilar ko‘radi.</p>
+            </div>
+          `}
+        </div>
+        <form class="chat-composer" data-chat-form>
+          <div class="chat-composer-form">
+            <div class="chat-composer-input-wrapper">
+              <textarea class="chat-composer-input" placeholder="Hammaga xabar yozing..." data-chat-input rows="1"></textarea>
+            </div>
+            <button class="chat-composer-send" type="submit">${icon('send')}</button>
+          </div>
+        </form>
+      </div>
+    `;
+  } else if (targetUser) {
+    threadHtml = `
+      <div class="chat-thread">
+        <div class="chat-thread-header">
+          <button class="icon-button chat-sidebar-toggle" type="button" data-action="chat-sidebar-toggle" aria-label="Suhbatlar ro‘yxati">${icon('chevron-left')}</button>
+          <div class="chat-thread-avatar">${avatarHtml(targetUser, 'md')}${isUserOnline(targetUser.id) ? '<span class="avatar-online" title="Onlayn"></span>' : ''}</div>
+          <div class="chat-thread-info">
+            <span class="chat-thread-title">${esc(targetUser.display_name)}</span>
+            <span class="chat-thread-status ${isUserOnline(targetUser.id) ? 'online' : ''}">${isUserOnline(targetUser.id) ? 'onlayn' : 'oflayn'}</span>
+          </div>
+        </div>
+        <div class="chat-messages" data-chat-messages>
+          ${messages.length ? messages.map((msg) => renderChatMessage(msg)).join('') : `
+            <div class="chat-empty-state">
+              <span class="icon">${icon('chat')}</span>
+              <h3>Xabarlar yo‘q</h3>
+              <p>Birinchi bo‘lib xabar yuboring.</p>
+            </div>
+          `}
+        </div>
+        <form class="chat-composer" data-chat-form>
+          <div class="chat-composer-form">
+            <div class="chat-composer-input-wrapper">
+              <textarea class="chat-composer-input" placeholder="${esc(targetUser.display_name)}ga xabar yozing..." data-chat-input rows="1"></textarea>
+            </div>
+            <button class="chat-composer-send" type="submit">${icon('send')}</button>
+          </div>
+        </form>
+      </div>
+    `;
+  } else {
+    threadHtml = `
+      <div class="chat-thread">
+        <div class="chat-empty-state">
+          <span class="icon">${icon('chat')}</span>
+          <h3>Suhbat topilmadi</h3>
+          <p>Chapdan suhbatni tanlang yoki yangi boshlang.</p>
+        </div>
+      </div>
+    `;
+  }
+
+  return `
+    <section class="view view--chat">
+      <div class="chat-page">
+        <aside class="chat-sidebar ${app.chatSidebarOpen ? 'is-open' : ''}" data-chat-sidebar>
+          ${chatListHtml}
+        </aside>
+        ${threadHtml}
+        <div class="chat-overlay ${app.chatSidebarOpen ? 'is-visible' : ''}" data-chat-overlay></div>
+      </div>
+    </section>
+  `;
+}
+
+function renderChatMessage(msg) {
+  const time = parseIso(msg.created_at);
+  const timeStr = time ? time.toLocaleTimeString('uz-UZ', { hour: '2-digit', minute: '2-digit' }) : '';
+  const isMine = msg.mine;
+  const sender = msg.sender;
+
+  let content = '';
+  if (msg.image) {
+    content = `<a href="${esc(msg.image)}" target="_blank" class="chat-message-image"><img src="${esc(msg.image)}" alt="Dalil rasmi" loading="lazy"></a>`;
+  } else {
+    content = esc(msg.body);
+  }
+
+  return `
+    <div class="chat-message ${isMine ? 'mine' : ''}" data-message-id="${esc(msg.id)}">
+      ${!isMine ? `
+        <div class="chat-message-avatar">
+          ${avatarHtml(sender, 'sm')}
+        </div>
+      ` : ''}
+      <div class="chat-message-bubble">
+        ${!isMine ? `<span class="chat-message-sender">${esc(sender.display_name)}</span>` : ''}
+        ${content}
+        <span class="chat-message-time">${timeStr}</span>
+      </div>
+    </div>
+  `;
+}
+
+function lastSeenHtml(user) {
+  if (!user.last_seen_at) return '<span class="profile-last-seen">Hali kirmagan</span>';
+  const online = isUserOnline(user.id);
+  if (online) return '<span class="profile-last-seen online">Hozir onlayn</span>';
+  return `<span class="profile-last-seen">Oxirgi marta: ${esc(fullDate(user.last_seen_at))} ${esc(timeAgo(user.last_seen_at).replace(' oldin', ''))}da</span>`;
 }

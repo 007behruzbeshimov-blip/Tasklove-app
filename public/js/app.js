@@ -8,6 +8,16 @@ let authSubmitting = false;
 let logoutBusy = false;
 let eventsBound = false;
 
+// Chat state
+app.chat = {
+  active: 'general',
+  messages: [],
+  directs: [],
+  general: null,
+  loading: false,
+  sidebarOpen: false,
+};
+
 /* --------------------------------------------------------------------------
    Ekranlar
    -------------------------------------------------------------------------- */
@@ -74,6 +84,12 @@ function parseRoute() {
   if (!path || path === 'board' || path === 'kirish') return { name: 'board' };
   if (path === 'people') return { name: 'people' };
   if (path === 'me') return { name: 'profile', self: true, userId: null };
+  if (path === 'chat') return { name: 'chat', userId: 'general' };
+
+  const chatMatch = /^chat\/([A-Za-z0-9-]+)$/.exec(path);
+  if (chatMatch) {
+    return { name: 'chat', userId: chatMatch[1] };
+  }
 
   const match = /^profile\/([A-Za-z0-9-]+)$/.exec(path);
   if (match) {
@@ -303,8 +319,245 @@ function handleRealtimeNotification(meta) {
     if (app.route.name === 'profile' && app.route.userId === meta.actorId) {
       toast('Profil o‘chirildi', `${meta.actorName} o‘z akkauntini o‘chirdi.`, 'info');
     }
+  } else if (meta.kind === 'message.created') {
+    const message = meta.message;
+    if (!message) return;
+    const isGeneral = !message.recipient_id;
+    const isDM = message.recipient_id && (message.recipient_id === me.id || message.sender_id === me.id);
+
+    // If we're on chat page and viewing this conversation, refresh messages
+    if (app.route.name === 'chat') {
+      const activeTarget = app.chat?.active;
+      if (isGeneral && activeTarget === 'general') {
+        loadChatMessages('general');
+        return;
+      }
+      if (isDM && activeTarget && activeTarget !== 'general') {
+        if (message.sender_id === activeTarget || message.recipient_id === activeTarget) {
+          loadChatMessages(activeTarget);
+          return;
+        }
+      }
+    }
+
+    // Show toast for DMs (not general)
+    if (isDM && message.sender_id !== me.id) {
+      toast(
+        `Xabar: ${message.sender.display_name}`,
+        message.body.length > 60 ? message.body.slice(0, 60) + '…' : message.body,
+        'info',
+      );
+    } else if (isGeneral && app.route.name !== 'chat') {
+      toast(
+        'Umumiy suhbatda yangi xabar',
+        `${message.sender.display_name}: ${message.body.length > 50 ? message.body.slice(0, 50) + '…' : message.body}`,
+        'info',
+      );
+    }
   }
 }
+
+/* --------------------------------------------------------------------------
+   Chat / Suhbatlar
+   -------------------------------------------------------------------------- */
+
+function initChat() {
+  const route = app.route;
+  const target = route.userId || 'general';
+  app.chat.active = target;
+  app.chatSidebarOpen = false;
+
+  // Load chat list and messages
+  loadChatList();
+}
+
+async function loadChatList() {
+  if (!app.data) return;
+  app.chat.loading = true;
+  try {
+    const data = await api('/api/chat');
+    if (!app.data) return;
+    app.chat.general = data.general;
+    app.chat.directs = data.directs || [];
+    app.chat.loading = false;
+    renderApp();
+    loadChatMessages(app.chat.active);
+  } catch (error) {
+    app.chat.loading = false;
+    if (error.status === 401) handleUnauthorized();
+  }
+}
+
+async function loadChatMessages(target) {
+  if (!app.data) return;
+  app.chat.active = target;
+  const isGeneral = target === 'general';
+
+  try {
+    const data = await api(`/api/messages${isGeneral ? '' : `?with=${encodeURIComponent(target)}`}`);
+    if (!app.data) return;
+    app.chat.messages = data.messages || [];
+    app.chat.general = isGeneral ? { ...app.chat.general, last_message: data.messages?.[data.messages.length - 1] || null } : app.chat.general;
+    
+    // Update the conversation list with new last message
+    if (!isGeneral && data.with) {
+      const idx = app.chat.directs.findIndex((c) => c.user.id === target);
+      if (idx >= 0 && data.messages.length) {
+        const lastMsg = data.messages[data.messages.length - 1];
+        app.chat.directs[idx].last_message = {
+          body: lastMsg.body,
+          created_at: lastMsg.created_at,
+          mine: lastMsg.mine,
+          sender_id: lastMsg.sender.id,
+        };
+      }
+    }
+    
+    // Render only the messages area if we're on chat page
+    if (app.route.name === 'chat') {
+      renderChatMessages();
+    }
+  } catch (error) {
+    if (error.status === 401) handleUnauthorized();
+  }
+}
+
+function renderChatMessages() {
+  const messagesContainer = document.querySelector('[data-chat-messages]');
+  if (!messagesContainer) return;
+  
+  const messages = app.chat.messages || [];
+  const me = currentUser();
+  
+  if (messages.length === 0) {
+    const isGeneral = app.chat.active === 'general';
+    messagesContainer.innerHTML = `
+      <div class="chat-empty-state">
+        <span class="icon">${icon(isGeneral ? 'users' : 'chat')}</span>
+        <h3>${isGeneral ? 'Hozircha xabarlar yo‘q' : 'Xabarlar yo‘q'}</h3>
+        <p>${isGeneral ? 'Birinchi bo‘lib salom bering! Barcha ishtirokchilar ko‘radi.' : 'Birinchi bo‘lib xabar yuboring.'}</p>
+      </div>
+    `;
+    return;
+  }
+
+  messagesContainer.innerHTML = messages.map((msg) => renderChatMessage(msg)).join('');
+  messagesContainer.scrollTop = messagesContainer.scrollHeight;
+}
+
+function renderChatMessage(msg) {
+  const time = parseIso(msg.created_at);
+  const timeStr = time ? time.toLocaleTimeString('uz-UZ', { hour: '2-digit', minute: '2-digit' }) : '';
+  const isMine = msg.mine;
+  const sender = msg.sender;
+
+  let content = '';
+  if (msg.image) {
+    content = `<a href="${esc(msg.image)}" target="_blank" class="chat-message-image"><img src="${esc(msg.image)}" alt="Dalil rasmi" loading="lazy"></a>`;
+  } else {
+    content = esc(msg.body);
+  }
+
+  return `
+    <div class="chat-message ${isMine ? 'mine' : ''}" data-message-id="${esc(msg.id)}">
+      ${!isMine ? `
+        <div class="chat-message-avatar">
+          ${avatarHtml(sender, 'sm')}
+        </div>
+      ` : ''}
+      <div class="chat-message-bubble">
+        ${!isMine ? `<span class="chat-message-sender">${esc(sender.display_name)}</span>` : ''}
+        ${content}
+        <span class="chat-message-time">${timeStr}</span>
+      </div>
+    </div>
+  `;
+}
+
+async function handleChatFormSubmit(event) {
+  event.preventDefault();
+  const form = event.target;
+  const input = form.querySelector('[data-chat-input]');
+  const sendBtn = form.querySelector('.chat-composer-send');
+  const text = input.value.trim();
+  if (!text) return;
+
+  const target = app.chat.active;
+  const isGeneral = target === 'general';
+
+  setButtonBusy(sendBtn, true, '');
+  input.disabled = true;
+
+  try {
+    await api('/api/messages', {
+      method: 'POST',
+      body: {
+        to: isGeneral ? null : target,
+        body: text,
+      },
+    });
+    input.value = '';
+    input.style.height = 'auto';
+    loadChatMessages(target);
+  } catch (error) {
+    if (error.status === 401) handleUnauthorized();
+    else toast('Yuborilmadi', error.message, 'error');
+  } finally {
+    setButtonBusy(sendBtn, false);
+    input.disabled = false;
+  }
+}
+
+function handleChatInput(event) {
+  const textarea = event.target;
+  const sendBtn = textarea.closest('form')?.querySelector('.chat-composer-send');
+  if (sendBtn) sendBtn.disabled = !textarea.value.trim();
+  
+  // Auto-resize
+  textarea.style.height = 'auto';
+  textarea.style.height = Math.min(textarea.scrollHeight, 140) + 'px';
+}
+
+function handleChatSidebarToggle() {
+  app.chatSidebarOpen = !app.chatSidebarOpen;
+  renderApp();
+}
+
+function handleChatItemClick(event) {
+  const link = event.target.closest('[data-chat-target]');
+  if (!link) return;
+  event.preventDefault();
+  
+  const target = link.dataset.chatTarget;
+  if (target === 'general') {
+    navigate('/chat');
+  } else {
+    navigate(`/chat/${target}`);
+  }
+  app.chatSidebarOpen = false;
+}
+
+// Override handleAction for chat
+const originalHandleAction = handleAction;
+function handleAction(node) {
+  const action = node.dataset.action;
+  if (!action) return;
+
+  if (action === 'chat-sidebar-toggle') {
+    handleChatSidebarToggle();
+    return;
+  }
+
+  if (action === 'chat-item') {
+    handleChatItemClick(event);
+    return;
+  }
+
+  originalHandleAction(node);
+}
+
+// Update handleRealtimeNotification to include chat events
+// Already done above
 
 /* --------------------------------------------------------------------------
    Auth
@@ -771,6 +1024,20 @@ function bindEvents() {
   document.addEventListener('submit', handleDocumentSubmit);
   document.addEventListener('input', handleDocumentInput);
   window.addEventListener('hashchange', handleRouteChange);
+
+  // Chat form and input delegation
+  document.addEventListener('submit', (event) => {
+    if (event.target.matches('[data-chat-form]')) {
+      event.preventDefault();
+      handleChatFormSubmit(event);
+    }
+  });
+
+  document.addEventListener('input', (event) => {
+    if (event.target.matches('[data-chat-input]')) {
+      handleChatInput(event);
+    }
+  });
 
   window.addEventListener('offline', () => {
     if (app.data) setStreamStatus(false, 'oflayn');

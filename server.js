@@ -22,7 +22,11 @@ const DB_PATH = process.env.DB_PATH
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number.parseInt(process.env.PORT || '3000', 10);
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const MAX_BODY_BYTES = 64 * 1024;
+const MAX_BODY_BYTES = 8 * 1024 * 1024;
+const MAX_AVATAR_BYTES = 2 * 1024 * 1024;
+const MAX_PROOF_BYTES = 4 * 1024 * 1024;
+const MESSAGE_MAX_LENGTH = 1000;
+const LAST_SEEN_WRITE_MS = 60 * 1000;
 const COOKIE_NAME = 'tasklove_session';
 
 const USERNAME_RE = /^[a-z0-9_]{3,20}$/;
@@ -59,7 +63,11 @@ db.exec(`
     bio           TEXT NOT NULL DEFAULT '',
     emoji         TEXT NOT NULL DEFAULT '🌷',
     accent        TEXT NOT NULL DEFAULT '#b84a5f',
-    created_at    TEXT NOT NULL
+    created_at    TEXT NOT NULL,
+    last_seen_at  TEXT,
+    avatar_image  BLOB,
+    avatar_mime   TEXT,
+    avatar_updated_at TEXT
   );
 
   CREATE TABLE IF NOT EXISTS sessions (
@@ -104,13 +112,44 @@ db.exec(`
     task_mode     TEXT NOT NULL,
     task_category TEXT NOT NULL,
     points        INTEGER NOT NULL DEFAULT 1 CHECK (points >= 0),
-    completed_at  TEXT NOT NULL
+    completed_at  TEXT NOT NULL,
+    proof_image   BLOB,
+    proof_mime    TEXT
   );
   CREATE UNIQUE INDEX IF NOT EXISTS idx_completions_one_per_task
     ON completions(task_id) WHERE task_id IS NOT NULL;
   CREATE INDEX IF NOT EXISTS idx_completions_user ON completions(user_id, completed_at);
   CREATE INDEX IF NOT EXISTS idx_completions_date ON completions(completed_at);
+
+  CREATE TABLE IF NOT EXISTS messages (
+    id           TEXT PRIMARY KEY,
+    sender_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    recipient_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+    body         TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_messages_general
+    ON messages(created_at) WHERE recipient_id IS NULL;
+  CREATE INDEX IF NOT EXISTS idx_messages_sender
+    ON messages(sender_id, created_at);
+  CREATE INDEX IF NOT EXISTS idx_messages_recipient
+    ON messages(recipient_id, created_at);
 `);
+
+// Mavjud ma'lumotlar bazasini yangi ustunlar bilan yangilaymiz.
+function ensureColumn(table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!columns.some((item) => item.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+ensureColumn('users', 'last_seen_at', 'TEXT');
+ensureColumn('users', 'avatar_image', 'BLOB');
+ensureColumn('users', 'avatar_mime', 'TEXT');
+ensureColumn('users', 'avatar_updated_at', 'TEXT');
+ensureColumn('completions', 'proof_image', 'BLOB');
+ensureColumn('completions', 'proof_mime', 'TEXT');
 
 const statements = {
   sessionByHash: db.prepare(`
@@ -129,6 +168,7 @@ const statements = {
   usersWithPoints: db.prepare(`
     SELECT
       u.id, u.username, u.display_name, u.bio, u.emoji, u.accent, u.created_at,
+      u.last_seen_at, u.avatar_updated_at,
       COALESCE(SUM(c.points), 0) AS points,
       COUNT(c.id) AS completed_count
     FROM users u
@@ -143,13 +183,17 @@ const statements = {
       creator.display_name AS creator_display_name,
       creator.emoji AS creator_emoji,
       creator.accent AS creator_accent,
+      creator.avatar_updated_at AS creator_avatar_updated_at,
       completer.username AS completer_username,
       completer.display_name AS completer_display_name,
       completer.emoji AS completer_emoji,
-      completer.accent AS completer_accent
+      completer.accent AS completer_accent,
+      completer.avatar_updated_at AS completer_avatar_updated_at,
+      proof.id AS proof_completion_id
     FROM tasks t
     JOIN users creator ON creator.id = t.creator_id
     LEFT JOIN users completer ON completer.id = t.completed_by
+    LEFT JOIN completions proof ON proof.task_id = t.id
     ORDER BY
       CASE WHEN t.status = 'active' THEN 0 ELSE 1 END,
       t.created_at DESC
@@ -157,13 +201,16 @@ const statements = {
   allParticipants: db.prepare(`
     SELECT
       tp.task_id,
-      u.id, u.username, u.display_name, u.emoji, u.accent
+      u.id, u.username, u.display_name, u.emoji, u.accent, u.avatar_updated_at
     FROM task_participants tp
     JOIN users u ON u.id = tp.user_id
     ORDER BY u.display_name COLLATE NOCASE ASC
   `),
   allCompletions: db.prepare(`
-    SELECT id, user_id, task_id, task_title, creator_name, task_mode, task_category, points, completed_at
+    SELECT
+      id, user_id, task_id, task_title, creator_name, task_mode, task_category,
+      points, completed_at,
+      CASE WHEN proof_image IS NOT NULL THEN 1 ELSE 0 END AS has_proof
     FROM completions
     ORDER BY completed_at DESC
   `),
@@ -175,12 +222,25 @@ const statements = {
   `),
   participantsOfTask: db.prepare('SELECT user_id FROM task_participants WHERE task_id = ?'),
   insertUser: db.prepare(`
-    INSERT INTO users (id, username, password_hash, display_name, bio, emoji, accent, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO users
+      (id, username, password_hash, display_name, bio, emoji, accent, created_at, last_seen_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
   updateUserProfile: db.prepare(`
     UPDATE users SET display_name = ?, bio = ?, emoji = ?, accent = ? WHERE id = ?
   `),
+  updateUserAvatar: db.prepare(`
+    UPDATE users SET avatar_image = ?, avatar_mime = ?, avatar_updated_at = ? WHERE id = ?
+  `),
+  clearUserAvatar: db.prepare(`
+    UPDATE users SET avatar_image = NULL, avatar_mime = NULL, avatar_updated_at = ? WHERE id = ?
+  `),
+  touchLastSeen: db.prepare(`
+    UPDATE users SET last_seen_at = ?
+    WHERE id = ? AND (last_seen_at IS NULL OR last_seen_at < ?)
+  `),
+  avatarById: db.prepare('SELECT avatar_image, avatar_mime FROM users WHERE id = ?'),
+  proofById: db.prepare('SELECT proof_image, proof_mime FROM completions WHERE id = ?'),
   insertTask: db.prepare(`
     INSERT INTO tasks (id, creator_id, title, description, mode, category, due_date, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -193,8 +253,75 @@ const statements = {
   `),
   insertCompletion: db.prepare(`
     INSERT INTO completions
-      (id, task_id, user_id, task_title, creator_name, task_mode, task_category, points, completed_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+      (id, task_id, user_id, task_title, creator_name, task_mode, task_category,
+       points, completed_at, proof_image, proof_mime)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+  `),
+  insertMessage: db.prepare(`
+    INSERT INTO messages (id, sender_id, recipient_id, body, created_at)
+    VALUES (?, ?, ?, ?, ?)
+  `),
+  generalMessages: db.prepare(`
+    SELECT
+      m.id, m.sender_id, m.recipient_id, m.body, m.created_at,
+      s.username AS sender_username,
+      s.display_name AS sender_display_name,
+      s.emoji AS sender_emoji,
+      s.accent AS sender_accent,
+      s.avatar_updated_at AS sender_avatar_updated_at
+    FROM messages m
+    JOIN users s ON s.id = m.sender_id
+    WHERE m.recipient_id IS NULL
+    ORDER BY m.created_at DESC, m.rowid DESC
+    LIMIT 100
+  `),
+  directMessages: db.prepare(`
+    SELECT
+      m.id, m.sender_id, m.recipient_id, m.body, m.created_at,
+      s.username AS sender_username,
+      s.display_name AS sender_display_name,
+      s.emoji AS sender_emoji,
+      s.accent AS sender_accent,
+      s.avatar_updated_at AS sender_avatar_updated_at
+    FROM messages m
+    JOIN users s ON s.id = m.sender_id
+    WHERE (m.sender_id = ? AND m.recipient_id = ?)
+       OR (m.sender_id = ? AND m.recipient_id = ?)
+    ORDER BY m.created_at DESC, m.rowid DESC
+    LIMIT 120
+  `),
+  generalLastMessage: db.prepare(`
+    SELECT
+      m.id, m.sender_id, m.recipient_id, m.body, m.created_at,
+      s.username AS sender_username,
+      s.display_name AS sender_display_name,
+      s.emoji AS sender_emoji,
+      s.accent AS sender_accent,
+      s.avatar_updated_at AS sender_avatar_updated_at
+    FROM messages m
+    JOIN users s ON s.id = m.sender_id
+    WHERE m.recipient_id IS NULL
+    ORDER BY m.created_at DESC, m.rowid DESC
+    LIMIT 1
+  `),
+  directLastMessages: db.prepare(`
+    SELECT * FROM (
+      SELECT
+        m.id, m.sender_id, m.recipient_id, m.body, m.created_at,
+        s.username AS sender_username,
+        s.display_name AS sender_display_name,
+        s.emoji AS sender_emoji,
+        s.accent AS sender_accent,
+        s.avatar_updated_at AS sender_avatar_updated_at,
+        CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END AS other_id,
+        ROW_NUMBER() OVER (
+          PARTITION BY CASE WHEN m.sender_id = ? THEN m.recipient_id ELSE m.sender_id END
+          ORDER BY m.created_at DESC, m.rowid DESC
+        ) AS rn
+      FROM messages m
+      JOIN users s ON s.id = m.sender_id
+      WHERE m.recipient_id IS NOT NULL AND (m.sender_id = ? OR m.recipient_id = ?)
+    ) WHERE rn = 1
   `),
   deleteTask: db.prepare('DELETE FROM tasks WHERE id = ?'),
   deleteUser: db.prepare('DELETE FROM users WHERE id = ?'),
@@ -283,6 +410,7 @@ function cleanText(value, { field, min = 0, max, required = true }) {
 }
 
 function publicUser(row) {
+  const avatarUrl = row.avatar_image ? `/api/avatars/${row.id}?v=${encodeURIComponent(row.avatar_updated_at || '')}` : null;
   return {
     id: row.id,
     username: row.username,
@@ -291,18 +419,22 @@ function publicUser(row) {
     emoji: row.emoji || '🌷',
     accent: row.accent || '#b84a5f',
     created_at: row.created_at,
+    last_seen_at: row.last_seen_at,
+    avatar_url: avatarUrl,
     points: Number(row.points || 0),
     completed_count: Number(row.completed_count || 0),
   };
 }
 
 function miniUser(row) {
+  const avatarUrl = row.avatar_image ? `/api/avatars/${row.id}?v=${encodeURIComponent(row.avatar_updated_at || '')}` : null;
   return {
     id: row.id,
     username: row.username,
     display_name: row.display_name,
     emoji: row.emoji || '🌷',
     accent: row.accent || '#b84a5f',
+    avatar_url: avatarUrl,
   };
 }
 
@@ -352,7 +484,19 @@ function getAuth(req) {
     return null;
   }
 
+  const lastSeen = row.last_seen_at ? Date.parse(row.last_seen_at) : null;
+  const isFreshEnough = lastSeen !== null && lastSeen + LAST_SEEN_WRITE_MS > Date.now();
+  if (!isFreshEnough) touchLastSeen({ user: { ...row, id: row.id } });
+
   return { token, tokenHash, user: row };
+}
+
+function touchLastSeen(auth) {
+  const now = nowIso();
+  const cutoff = new Date(Date.now() - LAST_SEEN_WRITE_MS).toISOString();
+  const result = statements.touchLastSeen.run(now, auth.user.id, cutoff);
+  if (result.changes > 0) auth.user.last_seen_at = now;
+  return auth.user.last_seen_at;
 }
 
 function requireAuth(req) {
@@ -402,6 +546,52 @@ function clientIp(req) {
   return req.socket.remoteAddress || 'unknown';
 }
 
+const IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+
+function detectImageMime(buffer) {
+  if (buffer.length < 12) return null;
+  // JPEG: FF D8 FF
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg';
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47 &&
+      buffer[4] === 0x0d && buffer[5] === 0x0a && buffer[6] === 0x1a && buffer[7] === 0x0a) return 'image/png';
+  // GIF: GIF87a / GIF89a
+  if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46 &&
+      buffer[3] === 0x38 && (buffer[4] === 0x37 || buffer[4] === 0x39) && buffer[5] === 0x61) return 'image/gif';
+  // WebP: RIFF .... WEBP
+  if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+      buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50) return 'image/webp';
+  return null;
+}
+
+function decodeImageDataUrl(dataUrl, { field, maxBytes }) {
+  if (typeof dataUrl !== 'string') throw new HttpError(400, `${field} matn bo'lishi kerak.`);
+  const match = /^data:(image\/(?:jpeg|png|webp|gif));base64,([a-zA-Z0-9+/=\s]+)$/.exec(dataUrl);
+  if (!match) throw new HttpError(400, `${field} noto'g'ri formatda. JPEG, PNG, WebP yoki GIF rasm yuklang.`);
+  const base64 = match[2].replace(/\s+/g, '');
+  if (base64.length > Math.ceil(maxBytes * 4 / 3) + 100) {
+    throw new HttpError(400, `${field} hajmi ${maxBytes / 1024 / 1024} MB dan oshmasligi kerak.`);
+  }
+  const buffer = Buffer.from(base64, 'base64');
+  if (buffer.length > maxBytes) throw new HttpError(400, `${field} hajmi ${maxBytes / 1024 / 1024} MB dan oshmasligi kerak.`);
+  if (buffer.length === 0) throw new HttpError(400, `${field} bo'sh bo'lmasligi kerak.`);
+  const mime = detectImageMime(buffer);
+  if (!mime) throw new HttpError(400, `${field} noto'g'ri rasm formati.`);
+  if (!IMAGE_MIME_TYPES.has(mime)) throw new HttpError(400, `${field} ruxsat etilgan formatlar: JPEG, PNG, WebP, GIF.`);
+  return { buffer, mime };
+}
+
+function sendImage(res, buffer, mime) {
+  res.writeHead(200, {
+    'Content-Type': mime,
+    'Content-Length': buffer.length,
+    'Cache-Control': 'private, max-age=300',
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': "default-src 'none'; style-src 'none'; sandbox",
+  });
+  res.end(buffer);
+}
+
 // ---------------------------------------------------------------------------
 // Rate limit
 // ---------------------------------------------------------------------------
@@ -446,6 +636,13 @@ function sseWrite(res, event, payload) {
 function broadcast(event, payload) {
   for (const client of sseClients) {
     sseWrite(client.res, event, payload);
+  }
+}
+
+function broadcastToUsers(userIds, event, payload) {
+  const targets = new Set(userIds);
+  for (const client of sseClients) {
+    if (targets.has(client.userId)) sseWrite(client.res, event, payload);
   }
 }
 
@@ -572,6 +769,9 @@ function buildState(auth) {
           display_name: row.completer_display_name,
           emoji: row.completer_emoji || '🕊️',
           accent: row.completer_accent || '#8a7770',
+          avatar_url: row.completer_avatar_updated_at
+            ? `/api/avatars/${row.completed_by}?v=${encodeURIComponent(row.completer_avatar_updated_at)}`
+            : null,
         }
       : row.completer_name
         ? {
@@ -580,6 +780,7 @@ function buildState(auth) {
             display_name: row.completer_name,
             emoji: '🕊️',
             accent: '#8a7770',
+            avatar_url: null,
           }
         : null;
 
@@ -599,6 +800,9 @@ function buildState(auth) {
         display_name: row.creator_display_name,
         emoji: row.creator_emoji,
         accent: row.creator_accent,
+        avatar_url: row.creator_avatar_updated_at
+          ? `/api/avatars/${row.creator_id}?v=${encodeURIComponent(row.creator_avatar_updated_at)}`
+          : null,
       },
       participants,
       participant_ids: [...participantIds],
@@ -607,6 +811,7 @@ function buildState(auth) {
       can_delete: isCreator && row.status === 'active',
       is_creator: isCreator,
       is_participant: isParticipant,
+      proof_url: row.proof_completion_id ? `/api/proofs/${row.proof_completion_id}` : null,
     };
   });
 
@@ -620,6 +825,8 @@ function buildState(auth) {
     task_category: row.task_category,
     points: Number(row.points),
     completed_at: row.completed_at,
+    has_proof: Boolean(row.has_proof),
+    proof_url: row.has_proof ? `/api/proofs/${row.id}` : null,
   }));
 
   const onlineIds = onlineUserIds();
@@ -685,6 +892,7 @@ async function handleRegister(req, res, body) {
       emoji,
       accent,
       createdAt,
+      createdAt,
     );
   } catch (error) {
     if (String(error.message).includes('UNIQUE')) {
@@ -730,6 +938,7 @@ async function handleLogin(req, res, body) {
   const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
   const token = randomToken();
   statements.createSession.run(sha256(token), user.id, createdAt, expiresAt);
+  statements.touchLastSeen.run(createdAt, user.id, new Date(0).toISOString());
 
   // Eski sinib qolgan sessiyalarni vaqti-vaqti bilan olib tashlaymiz.
   db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(createdAt);
@@ -750,6 +959,9 @@ async function handleLogin(req, res, body) {
 async function handleLogout(req, res) {
   const auth = getAuth(req);
   if (auth) {
+    // Oxirgi ko'rinish vaqtini yangilaymiz
+    const now = nowIso();
+    statements.touchLastSeen.run(now, auth.user.id, new Date(0).toISOString());
     statements.deleteSession.run(auth.tokenHash);
     closeStreams({ tokenHash: auth.tokenHash });
   }
@@ -846,7 +1058,9 @@ async function handleCreateTask(req, res, auth, body) {
   return sendJson(res, 201, { taskId });
 }
 
-async function handleCompleteTask(res, auth, taskId) {
+async function handleCompleteTask(req, res, auth, taskId) {
+  const body = await readJson(req);
+
   const task = statements.taskById.get(taskId);
   if (!task) throw new HttpError(404, 'Bunday vazifa topilmadi.');
   if (task.status === 'completed') {
@@ -860,6 +1074,10 @@ async function handleCompleteTask(res, auth, taskId) {
   if (task.mode !== 'open' && !participantIds.includes(auth.user.id)) {
     throw new HttpError(403, "Bu vazifa sizga tegishli emas.");
   }
+
+  const proofDataUrl = body.proof_image;
+  if (!proofDataUrl) throw new HttpError(400, "Vazifani bajarilgan deb belgilash uchun rasm yuklang.");
+  const proof = decodeImageDataUrl(proofDataUrl, { field: 'Dalil rasmi', maxBytes: MAX_PROOF_BYTES });
 
   const completedAt = nowIso();
   const completionId = randomId();
@@ -899,6 +1117,8 @@ async function handleCompleteTask(res, auth, taskId) {
       fresh.mode,
       fresh.category,
       completedAt,
+      proof.buffer,
+      proof.mime,
     );
     db.exec('COMMIT');
   } catch (error) {
@@ -959,6 +1179,17 @@ async function handleUpdateProfile(req, res, auth, body) {
   if (!ACCENTS.has(accent)) throw new HttpError(400, "Rang noto'g'ri.");
 
   statements.updateUserProfile.run(displayName, bio, emoji, accent, auth.user.id);
+
+  // Avatar yangilash/o'chirish
+  if (body.avatar_image !== undefined && body.avatar_image !== null && body.avatar_image !== '') {
+    const avatar = decodeImageDataUrl(body.avatar_image, { field: 'Profil rasmi', maxBytes: MAX_AVATAR_BYTES });
+    const now = nowIso();
+    statements.updateUserAvatar.run(avatar.buffer, avatar.mime, now, auth.user.id);
+  } else if (body.remove_avatar === true) {
+    const now = nowIso();
+    statements.clearUserAvatar.run(now, auth.user.id);
+  }
+
   broadcastSync({
     kind: 'profile.updated',
     actorId: auth.user.id,
@@ -1024,6 +1255,147 @@ async function handleDeleteAccount(req, res, auth, body) {
   return sendJson(res, 200, { ok: true });
 }
 
+function messageToJson(row, meId) {
+  return {
+    id: row.id,
+    sender: {
+      id: row.sender_id,
+      username: row.sender_username,
+      display_name: row.sender_display_name,
+      emoji: row.sender_emoji,
+      accent: row.sender_accent,
+      avatar_url: row.sender_avatar_updated_at
+        ? `/api/avatars/${row.sender_id}?v=${encodeURIComponent(row.sender_avatar_updated_at)}`
+        : null,
+    },
+    recipient_id: row.recipient_id,
+    body: row.body,
+    created_at: row.created_at,
+    mine: row.sender_id === meId,
+  };
+}
+
+function lastMessageToJson(row, meId) {
+  if (!row) return null;
+  return {
+    body: row.body,
+    created_at: row.created_at,
+    mine: row.sender_id === meId,
+    sender_id: row.sender_id,
+  };
+}
+
+async function handleChatList(req, res, auth) {
+  const meId = auth.user.id;
+
+  // Umumiy sohbat oxirgi xabari
+  const generalLast = statements.generalLastMessage.get();
+
+  // Shaxsiy suhbatlarning oxirgi xabarlari
+  const directLastRows = statements.directLastMessages.all(meId, meId, meId, meId);
+
+  // Barcha foydalanuvchilarni olamiz (o'zimizdan tashqari)
+  const allUsers = statements.usersWithPoints.all().filter((u) => u.id !== meId);
+
+  // Oxirgi xabarlar harflar bo'yicha
+  const lastByOther = new Map();
+  for (const row of directLastRows) {
+    const otherId = row.other_id;
+    if (!lastByOther.has(otherId)) lastByOther.set(otherId, row);
+  }
+
+  const directs = allUsers.map((user) => {
+    const last = lastByOther.get(user.id);
+    return {
+      user: publicUser(user),
+      last_message: lastMessageToJson(last, meId),
+    };
+  });
+
+  // Umumiy sohbat uchun
+  const general = {
+    last_message: lastMessageToJson(generalLast, meId),
+  };
+
+  return sendJson(res, 200, { general, directs });
+}
+
+async function handleGetMessages(req, res, auth, url) {
+  const meId = auth.user.id;
+  const withUserId = url.searchParams.get('with');
+
+  if (withUserId) {
+    if (withUserId === meId) throw new HttpError(400, "O'zingizga xabar yubora olmaysiz.");
+    const target = statements.userById.get(withUserId);
+    if (!target) throw new HttpError(404, 'Foydalanuvchi topilmadi.');
+
+    const rows = statements.directMessages.all(meId, withUserId, withUserId, meId);
+    const messages = rows.reverse().map((row) => messageToJson(row, meId));
+    return sendJson(res, 200, {
+      with: publicUser(target),
+      messages,
+    });
+  } else {
+    // Umumiy sohbat
+    const rows = statements.generalMessages.all();
+    const messages = rows.reverse().map((row) => messageToJson(row, meId));
+    return sendJson(res, 200, { messages });
+  }
+}
+
+async function handleSendMessage(req, res, auth, body) {
+  const meId = auth.user.id;
+  const to = body.to === undefined ? null : (typeof body.to === 'string' && body.to ? body.to : null);
+  const text = cleanText(body.body, { field: 'Xabar', min: 1, max: MESSAGE_MAX_LENGTH });
+
+  if (to) {
+    if (to === meId) throw new HttpError(400, "O'zingizga xabar yubora olmaysiz.");
+    const target = statements.userById.get(to);
+    if (!target) throw new HttpError(404, 'Foydalanuvchi topilmadi.');
+  }
+
+  rateLimit(`message:${meId}`, 60, 60 * 1000);
+
+  const id = randomId();
+  const createdAt = nowIso();
+  const recipientId = to || null;
+
+  statements.insertMessage.run(id, meId, recipientId, text, createdAt);
+
+  // Real-vaqt yuborish
+  const payload = {
+    kind: 'message.created',
+    message: {
+      id,
+      sender_id: meId,
+      recipient_id: recipientId,
+      body: text,
+      created_at: createdAt,
+      sender: {
+        id: auth.user.id,
+        username: auth.user.username,
+        display_name: auth.user.display_name,
+        emoji: auth.user.emoji,
+        accent: auth.user.accent,
+        avatar_url: auth.user.avatar_updated_at
+          ? `/api/avatars/${auth.user.id}?v=${encodeURIComponent(auth.user.avatar_updated_at)}`
+          : null,
+      },
+      mine: true,
+    },
+  };
+
+  if (recipientId) {
+    // Shaxsiy xabar - faqat yuboruvchi va qabul qiluvchiga
+    broadcastToUsers([meId, recipientId], 'message', payload);
+  } else {
+    // Umumiy xabar - barchaga
+    broadcast('message', payload);
+  }
+
+  return sendJson(res, 201, { id, created_at: createdAt });
+}
+
 async function handleApi(req, res, url) {
   setSecurityHeaders(res);
   assertSameOrigin(req);
@@ -1080,12 +1452,43 @@ async function handleApi(req, res, url) {
 
   const completeMatch = route.match(/^\/api\/tasks\/([a-f0-9-]+)\/complete$/);
   if (completeMatch && method === 'POST') {
-    return handleCompleteTask(res, auth, completeMatch[1]);
+    return handleCompleteTask(req, res, auth, completeMatch[1]);
   }
 
   const deleteMatch = route.match(/^\/api\/tasks\/([a-f0-9-]+)$/);
   if (deleteMatch && method === 'DELETE') {
     return handleDeleteTask(res, auth, deleteMatch[1]);
+  }
+
+  // Avatar rasmi
+  const avatarMatch = route.match(/^\/api\/avatars\/([a-f0-9-]+)$/);
+  if (avatarMatch && method === 'GET') {
+    const row = statements.avatarById.get(avatarMatch[1]);
+    if (!row || !row.avatar_image) throw new HttpError(404, 'Rasm topilmadi.');
+    return sendImage(res, row.avatar_image, row.avatar_mime);
+  }
+
+  // Dalil rasmi
+  const proofMatch = route.match(/^\/api\/proofs\/([a-f0-9-]+)$/);
+  if (proofMatch && method === 'GET') {
+    const row = statements.proofById.get(proofMatch[1]);
+    if (!row || !row.proof_image) throw new HttpError(404, 'Rasm topilmadi.');
+    return sendImage(res, row.proof_image, row.proof_mime);
+  }
+
+  // Suhbatlar ro'yxati (umumiy + shaxsiy)
+  if (route === '/api/chat' && method === 'GET') {
+    return handleChatList(req, res, auth);
+  }
+
+  // Xabarlar (umumiy yoki shaxsiy)
+  if (route === '/api/messages' && method === 'GET') {
+    return handleGetMessages(req, res, auth, url);
+  }
+
+  // Xabar yuborish
+  if (route === '/api/messages' && method === 'POST') {
+    return handleSendMessage(req, res, auth, await readJson(req));
   }
 
   throw new HttpError(404, 'Bunday API manzili mavjud emas.');

@@ -237,37 +237,170 @@ function openCompleteDialog(taskId) {
 
   const mode = modeMeta(task.mode);
   const category = categoryMeta(task.category);
+  let proofDataUrl = null;
+
   openModal({
     title: 'Vazifa bajarildi deb belgilansinmi?',
     eyebrow: mode.label,
     intro: 'Bir daqiqa. Bu qaytarib bo‘lmaydigan kichik qadam.',
     body: `
-      <div class="confirm-task">
-        <p class="eyebrow">${category.emoji} ${esc(category.label)}</p>
-        <h3>${esc(task.title)}</h3>
-        <p>${esc(task.creator.display_name)} tashlagan vazifa${task.due_date ? ` · muddat ${esc(dueLabel(task.due_date).toLowerCase())}` : ''}</p>
-        ${task.description ? `<p style="margin-top:7px">${esc(task.description)}</p>` : ''}
-      </div>
-      <div class="confirm-prize">
-        <span class="ball-coin">+1</span>
-        <div class="confirm-prize-copy">
-          <strong>Bir ball sizning hisobingizga qo‘shiladi.</strong>
-          <span>Va bu g‘alaba profilingizda abadiy qoladi.</span>
+      <form id="completeTaskForm" class="complete-form" novalidate>
+        <div class="confirm-task">
+          <p class="eyebrow">${category.emoji} ${esc(category.label)}</p>
+          <h3>${esc(task.title)}</h3>
+          <p>${esc(task.creator.display_name)} tashlagan vazifa${task.due_date ? ` · muddat ${esc(dueLabel(task.due_date).toLowerCase())}` : ''}</p>
+          ${task.description ? `<p style="margin-top:7px">${esc(task.description)}</p>` : ''}
         </div>
-      </div>
-      <p class="confirm-warning">
-        ${icon('clock')}
-        <span>${task.mode === 'solo'
-          ? 'Bu shaxsiy vazifa. Tasdiqlaganingizdan keyin yakunlangan deb belgilanadi.'
-          : 'Birgalikdagi vazifada poyga bor. Tasdiqlaganingizda vazifa yopiladi va boshqalar bajarolmaydi.'}</span>
-      </p>
+        <div class="confirm-prize">
+          <span class="ball-coin">+1</span>
+          <div class="confirm-prize-copy">
+            <strong>Bir ball sizning hisobingizga qo‘shiladi.</strong>
+            <span>Va bu g‘alaba profilingizda abadiy qoladi.</span>
+          </div>
+        </div>
+        
+        <div class="complete-proof-upload">
+          <label class="form-label">Dalil rasmi (majburiy)</label>
+          <div class="complete-proof-dropzone" data-dropzone>
+            <input type="file" id="proofInput" name="proof_image" accept="image/jpeg,image/png,image/webp,image/gif" required hidden>
+            <div class="complete-proof-dropzone-text" data-dropzone-text>
+              ${icon('image')}
+              <span>Rasmni shu yerga tashlang yoki tanlash uchun bosing</span>
+              <span class="hint">JPEG, PNG, WebP, GIF · 4 MB gacha</span>
+            </div>
+            <div class="complete-proof-preview" data-proof-preview hidden></div>
+          </div>
+          <p class="form-error" data-proof-error hidden></p>
+          <p class="complete-proof-hint">Bajarilgan vazifa uchun rasm yuklash majburiy. Bu sizning g‘alabangizning dalilidir.</p>
+        </div>
+        
+        <p class="confirm-warning">
+          ${icon('clock')}
+          <span>${task.mode === 'solo'
+            ? 'Bu shaxsiy vazifa. Tasdiqlaganingizdan keyin yakunlangan deb belgilanadi.'
+            : 'Birgalikdagi vazifada poyga bor. Tasdiqlaganingizda vazifa yopiladi va boshqalar bajarolmaydi.'}</span>
+        </p>
+      </form>
     `,
     footer: `
       <button class="button button--ghost" type="button" data-close-modal>Bekor qilish</button>
-      <button class="button button--primary" type="button" id="confirmCompleteButton" data-action="confirm-complete" data-task-id="${esc(task.id)}">
+      <button class="button button--primary" type="submit" form="completeTaskForm" id="confirmCompleteButton" disabled>
         Ha, bajardim ${icon('check')}
       </button>
     `,
+    onMount: (layer) => {
+      const form = layer.querySelector('#completeTaskForm');
+      const dropzone = layer.querySelector('[data-dropzone]');
+      const dropzoneText = layer.querySelector('[data-dropzone-text]');
+      const proofPreview = layer.querySelector('[data-proof-preview]');
+      const proofInput = layer.querySelector('#proofInput');
+      const submitBtn = layer.querySelector('#confirmCompleteButton');
+      const proofError = layer.querySelector('[data-proof-error]');
+
+      const updateSubmitState = () => {
+        submitBtn.disabled = !proofDataUrl;
+      };
+
+      const showPreview = (dataUrl) => {
+        proofPreview.innerHTML = `
+          <img src="${esc(dataUrl)}" alt="Dalil rasmi">
+          <button type="button" class="remove" data-remove-proof aria-label="Rasmni olib tashlash">${icon('close')}</button>
+        `;
+        proofPreview.hidden = false;
+        dropzoneText.hidden = true;
+        dropzone.classList.add('has-preview');
+        updateSubmitState();
+      };
+
+      const clearPreview = () => {
+        proofDataUrl = null;
+        proofPreview.innerHTML = '';
+        proofPreview.hidden = true;
+        dropzoneText.hidden = false;
+        dropzone.classList.remove('has-preview');
+        proofInput.value = '';
+        updateSubmitState();
+        showFormError(proofError, '');
+      };
+
+      const handleFile = async (file) => {
+        const validation = validateImageFile(file, { maxBytes: 4 * 1024 * 1024 });
+        if (!validation.ok) {
+          showFormError(proofError, validation.error);
+          return;
+        }
+        showFormError(proofError, '');
+        try {
+          const dataUrl = await readFileAsDataUrl(file);
+          proofDataUrl = dataUrl;
+          showPreview(dataUrl);
+        } catch {
+          showFormError(proofError, 'Rasm o‘qilmadi. Qayta urinib ko‘ring.');
+        }
+      };
+
+      // Click to select
+      dropzone.addEventListener('click', () => proofInput.click());
+
+      // File input change
+      proofInput.addEventListener('change', (event) => {
+        const file = event.target.files?.[0];
+        if (file) handleFile(file);
+      });
+
+      // Drag and drop
+      dropzone.addEventListener('dragover', (event) => {
+        event.preventDefault();
+        dropzone.classList.add('is-dragover');
+      });
+      dropzone.addEventListener('dragleave', (event) => {
+        event.preventDefault();
+        dropzone.classList.remove('is-dragover');
+      });
+      dropzone.addEventListener('drop', (event) => {
+        event.preventDefault();
+        dropzone.classList.remove('is-dragover');
+        const file = event.dataTransfer.files?.[0];
+        if (file) handleFile(file);
+      });
+
+      // Remove preview
+      proofPreview.addEventListener('click', (event) => {
+        if (event.target.closest('[data-remove-proof]')) {
+          clearPreview();
+        }
+      });
+
+      // Form submit
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if (!proofDataUrl) {
+          showFormError(proofError, 'Dalil rasmi yuklanishi kerak.');
+          return;
+        }
+        setButtonBusy(submitBtn, true, 'Yuborilmoqda…');
+        try {
+          await api(`/api/tasks/${esc(task.id)}/complete`, {
+            method: 'POST',
+            body: { proof_image: proofDataUrl },
+          });
+          closeModal();
+          heartBurst();
+          toast('G‘alaba!', '+1 ball qo‘shildi. Profilingizga g‘alaba yozildi.', 'success');
+          await refreshState();
+        } catch (error) {
+          setButtonBusy(submitBtn, false);
+          if (error.status === 409) {
+            toast('Vazifa yakunlangan', 'Kimdir sizdan tezroq bo‘lgan.', 'info');
+            await refreshState();
+          } else {
+            showFormError(proofError, error.message || 'Xato yuz berdi.');
+          }
+        }
+      });
+
+      updateSubmitState();
+    },
   });
 }
 
@@ -322,6 +455,9 @@ function openEditProfileDialog() {
     </label>
   `).join('');
 
+  let avatarDataUrl = me.avatar_url || null;
+  let removeAvatar = !me.avatar_url;
+
   openModal({
     title: 'Profilingizni yangilang.',
     eyebrow: 'O‘zingizni ko‘rsating',
@@ -329,7 +465,27 @@ function openEditProfileDialog() {
     size: 'modal--wide',
     body: `
       <form id="editProfileForm" class="edit-profile-form" novalidate>
-        <div class="edit-preview" data-edit-preview></div>
+        <div class="edit-avatar-section">
+          <label class="form-label">Profil rasmi</label>
+          <div class="avatar-upload-preview ${avatarDataUrl ? 'has-image' : ''}" data-avatar-preview>
+            ${avatarDataUrl ? `
+              <img class="avatar-image" src="${esc(avatarDataUrl)}" alt="Profil rasmi">
+              <button type="button" class="avatar-upload-remove" data-remove-avatar aria-label="Rasmni olib tashlash">${icon('remove')}</button>
+            ` : ''}
+          </div>
+          <div class="edit-avatar-actions">
+            <label class="button button--ghost button--small">
+              ${icon('image')} Rasm tanlash
+              <input type="file" id="avatarInput" name="avatar_image" accept="image/jpeg,image/png,image/webp,image/gif" hidden>
+            </label>
+            ${avatarDataUrl ? `
+              <button type="button" class="button button--ghost button--small" data-remove-avatar-btn>
+                ${icon('remove')} Rasmni olib tashlash
+              </button>
+            ` : ''}
+          </div>
+          <p class="form-hint">JPEG, PNG, WebP, GIF · 2 MB gacha</p>
+        </div>
 
         <div class="form-row">
           <div class="form-field">
@@ -375,19 +531,66 @@ function openEditProfileDialog() {
     `,
     onMount: (layer) => {
       const form = layer.querySelector('#editProfileForm');
-      const preview = layer.querySelector('[data-edit-preview]');
+      const preview = layer.querySelector('[data-avatar-preview]');
+      const avatarInput = layer.querySelector('#avatarInput');
+      const removeAvatarBtn = layer.querySelector('[data-remove-avatar-btn]');
+      const avatarPreviewRemove = layer.querySelector('[data-remove-avatar]');
+
+      const updatePreview = () => {
+        if (avatarDataUrl) {
+          preview.innerHTML = `
+            <img class="avatar-image" src="${esc(avatarDataUrl)}" alt="Profil rasmi">
+            <button type="button" class="avatar-upload-remove" data-remove-avatar aria-label="Rasmni olib tashlash">${icon('remove')}</button>
+          `;
+          preview.classList.add('has-image');
+        } else {
+          preview.innerHTML = '';
+          preview.classList.remove('has-image');
+        }
+      };
+
+      const handleAvatarFile = async (file) => {
+        const validation = validateImageFile(file, { maxBytes: 2 * 1024 * 1024 });
+        if (!validation.ok) {
+          showFormError(form.querySelector('[data-form-error]'), validation.error);
+          return;
+        }
+        showFormError(form.querySelector('[data-form-error]'), '');
+        try {
+          const dataUrl = await readFileAsDataUrl(file);
+          avatarDataUrl = dataUrl;
+          removeAvatar = false;
+          updatePreview();
+        } catch {
+          showFormError(form.querySelector('[data-form-error]'), 'Rasm o‘qilmadi. Qayta urinib ko‘ring.');
+        }
+      };
+
+      const clearAvatar = () => {
+        avatarDataUrl = null;
+        removeAvatar = true;
+        updatePreview();
+        avatarInput.value = '';
+      };
+
+      // Avatar input
+      layer.querySelector('[data-remove-avatar-btn]')?.addEventListener('click', clearAvatar);
+      layer.querySelector('[data-avatar-preview]')?.addEventListener('click', (event) => {
+        if (event.target.closest('[data-remove-avatar]')) clearAvatar();
+      });
+      avatarInput.addEventListener('change', (event) => {
+        const file = event.target.files?.[0];
+        if (file) handleAvatarFile(file);
+      });
+
+      // Click to select
+      preview.addEventListener('click', () => avatarInput.click());
 
       const refreshPreview = () => {
         const name = form.elements.display_name.value.trim() || 'Ismsiz yurak';
         const emoji = form.querySelector('input[name="emoji"]:checked')?.value || me.emoji;
         const accent = form.querySelector('input[name="accent"]:checked')?.value || me.accent;
-        preview.innerHTML = `
-          ${avatarHtml({ emoji, accent }, 'md')}
-          <div class="edit-preview-copy">
-            <strong>${esc(name)}</strong>
-            <span>@${esc(me.username)}</span>
-          </div>
-        `;
+        // This is just for the text preview, not the avatar image
       };
 
       refreshPreview();
@@ -395,6 +598,30 @@ function openEditProfileDialog() {
         if (event.target.name === 'display_name') refreshPreview();
       });
       form.addEventListener('change', refreshPreview);
+
+      // Form submit
+      form.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const submitBtn = layer.querySelector('#editProfileSubmit');
+        setButtonBusy(submitBtn, true, 'Saqlanmoqda…');
+        try {
+          const body = {
+            display_name: form.elements.display_name.value.trim(),
+            bio: form.elements.bio.value.trim(),
+            emoji: form.querySelector('input[name="emoji"]:checked')?.value,
+            accent: form.querySelector('input[name="accent"]:checked')?.value,
+            avatar_image: avatarDataUrl || undefined,
+            remove_avatar: removeAvatar || undefined,
+          };
+          await api('/api/profile', { method: 'PATCH', body });
+          closeModal();
+          toast('Saqlandi', 'Profilingiz yangilandi.', 'success');
+          await refreshState();
+        } catch (error) {
+          setButtonBusy(submitBtn, false);
+          showFormError(form.querySelector('[data-form-error]'), error.message || 'Xato yuz berdi.');
+        }
+      });
     },
   });
 }

@@ -209,6 +209,9 @@ test('tasklove full API, realtime, persistence and deletion flow', { timeout: 60
     assert.equal((await alice.state()).users.length, 3);
     assert.equal((await alice.state()).me.id, aliceUser.id);
 
+    // 1x1 transparent PNG for testing proof images
+    const testProofImage = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlYAAAAAElFTkSuQmCC';
+
     const soloResult = await alice.request('/api/tasks', {
       method: 'POST',
       body: {
@@ -281,8 +284,8 @@ test('tasklove full API, realtime, persistence and deletion flow', { timeout: 60
     const beforePoints = new Map(beforeRace.users.map((user) => [user.id, user.points]));
 
     const [bobRace, charlieRace] = await Promise.all([
-      bob.request(`/api/tasks/${raceTaskId}/complete`, { method: 'POST' }),
-      charlie.request(`/api/tasks/${raceTaskId}/complete`, { method: 'POST' }),
+      bob.request(`/api/tasks/${raceTaskId}/complete`, { method: 'POST', body: { proof_image: testProofImage } }),
+      charlie.request(`/api/tasks/${raceTaskId}/complete`, { method: 'POST', body: { proof_image: testProofImage } }),
     ]);
     const statuses = [bobRace.status, charlieRace.status].sort();
     assert.deepEqual(statuses, [200, 409], JSON.stringify([bobRace.payload, charlieRace.payload]));
@@ -292,12 +295,13 @@ test('tasklove full API, realtime, persistence and deletion flow', { timeout: 60
     assert.equal(raceTask.status, 'completed');
     assert.ok(raceTask.completer);
     const winnerId = raceTask.completer.id;
+    const charlieWonRace = winnerId === charlieUser.id;
     assert.ok(winnerId === bobUser.id || winnerId === charlieUser.id);
     const winnerPoints = afterRace.users.find((user) => user.id === winnerId).points;
     const beforeWinnerPoints = beforePoints.get(winnerId) || 0;
     assert.equal(winnerPoints, beforeWinnerPoints + 1);
 
-    const soloComplete = await bob.request(`/api/tasks/${soloTaskId}/complete`, { method: 'POST' });
+    const soloComplete = await bob.request(`/api/tasks/${soloTaskId}/complete`, { method: 'POST', body: { proof_image: testProofImage } });
     assert.equal(soloComplete.status, 200);
     assert.equal(soloComplete.payload.pointsEarned, 1);
     const afterSolo = await bob.state();
@@ -369,7 +373,11 @@ test('tasklove full API, realtime, persistence and deletion flow', { timeout: 60
     assert.equal(finalState.users.length, 1);
     assert.equal(finalState.users[0].id, charlieUser.id);
     assert.equal(finalState.completions.some((item) => item.user_id === bobUser.id), false);
-    assert.equal(finalState.completions.some((item) => item.user_id === charlieUser.id), true);
+    if (charlieWonRace) {
+      assert.equal(finalState.completions.some((item) => item.user_id === charlieUser.id), true);
+    } else {
+      assert.equal(finalState.completions.some((item) => item.user_id === charlieUser.id), false);
+    }
     assert.equal(
       finalState.users.find((user) => user.id === charlieUser.id).points,
       pointsBeforeDelete,
